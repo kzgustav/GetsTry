@@ -1,0 +1,1600 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>月次仕入れ価格変動トラッカー v2 (Lynn Edition)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            pagebg: '#f8fafc',
+            cardbg: '#ffffff',
+            bordercol: '#e2e8f0',
+            brand: '#3b82f6',
+            up: '#ef4444',
+            down: '#10b981',
+            next: '#a855f7',
+            textmain: '#1e293b',
+            textmuted: '#64748b',
+          }
+        }
+      }
+    }
+  </script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- ★ PapaParse CDN — 堅牢なCSVパーサー -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <style>
+    body { background-color: #f8fafc; color: #1e293b; font-size: 16px; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #f1f5f9; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    .hide-scrollbar::-webkit-scrollbar { display: none; }
+    .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect, useCallback, useRef } = React;
+
+    // ======================================================================
+    // ★ MODULE 1: IndexedDB 永続化レイヤー
+    // localStorage の代替。5MB制限なし、ブラウザ安定性大幅向上
+    // ======================================================================
+    const DB_NAME = 'MonthTrackerDB';
+    const DB_VERSION = 1;
+    const STORE_CONFIG = 'config';
+    const STORE_STATES = 'states';
+
+    const openDB = () => new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(STORE_CONFIG)) db.createObjectStore(STORE_CONFIG);
+        if (!db.objectStoreNames.contains(STORE_STATES)) db.createObjectStore(STORE_STATES);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+
+    const idbGet = async (store, key) => {
+      try {
+        const db = await openDB();
+        return new Promise((resolve) => {
+          const tx = db.transaction(store, 'readonly');
+          const req = tx.objectStore(store).get(key);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => resolve(null);
+        });
+      } catch { return null; }
+    };
+
+    const idbSet = async (store, key, value) => {
+      try {
+        const db = await openDB();
+        return new Promise((resolve) => {
+          const tx = db.transaction(store, 'readwrite');
+          tx.objectStore(store).put(value, key);
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = () => resolve(false);
+        });
+      } catch { return false; }
+    };
+
+    // localStorage からの移行ヘルパー
+    const migrateFromLocalStorage = async () => {
+      try {
+        const configStr = localStorage.getItem('monthTracker_config');
+        const statesStr = localStorage.getItem('monthTracker_states');
+        if (configStr) {
+          await idbSet(STORE_CONFIG, 'main', JSON.parse(configStr));
+          localStorage.removeItem('monthTracker_config');
+        }
+        if (statesStr) {
+          await idbSet(STORE_STATES, 'main', JSON.parse(statesStr));
+          localStorage.removeItem('monthTracker_states');
+        }
+      } catch {}
+    };
+
+    // ======================================================================
+    // ★ MODULE 2: 容量正規化エンジン（AIなしでグラム単価計算）
+    // ======================================================================
+    const UNIT_CONVERSIONS = {
+      // 重量 → グラム
+      'kg': 1000, 'ｋｇ': 1000, 'キロ': 1000,
+      'g': 1, 'ｇ': 1, 'グラム': 1,
+      // 容量 → ミリリットル
+      'l': 1000, 'ｌ': 1000, 'リットル': 1000, 'L': 1000,
+      'ml': 1, 'ｍｌ': 1, 'ミリリットル': 1, 'cc': 1,
+      'dl': 100, 'ｄｌ': 100, 'デシリットル': 100,
+      // 特殊容器（飲食業界の常識値）
+    };
+
+    // 飲食業界の暗黙知辞書（「中瓶」=334mlなど）
+    const CONTAINER_SIZES = {
+      '大瓶': { ml: 633 }, '大びん': { ml: 633 },
+      '中瓶': { ml: 334 }, '中びん': { ml: 334 }, '中ビン': { ml: 334 },
+      '小瓶': { ml: 250 }, '小びん': { ml: 250 },
+      'レギュラー缶': { ml: 350 }, 'ロング缶': { ml: 500 },
+      '樽': null, // 樽はサイズが明記されるので辞書不要
+    };
+
+    const extractVolume = (nameAndSpec) => {
+      const text = String(nameAndSpec).normalize('NFKC');
+
+      // パターン1: 数値+単位 （例: 700ml, 1.5L, 10kg, 5L）
+      const patterns = [
+        /(\d+(?:\.\d+)?)\s*(kg|ｋｇ|キロ|g|ｇ|グラム|l|ｌ|リットル|L|ml|ｍｌ|ミリリットル|cc|dl|ｄｌ|デシリットル)/gi,
+      ];
+      for (const pat of patterns) {
+        const match = pat.exec(text);
+        if (match) {
+          const num = parseFloat(match[1]);
+          const unitKey = match[2].toLowerCase();
+          const factor = UNIT_CONVERSIONS[unitKey] || UNIT_CONVERSIONS[match[2]];
+          if (factor) {
+            const baseUnit = ['kg','ｋｇ','キロ','g','ｇ','グラム'].some(u => unitKey === u.toLowerCase()) ? 'g' : 'ml';
+            return { value: num * factor, unit: baseUnit, raw: match[0] };
+          }
+        }
+      }
+
+      // パターン2: 容器名辞書 （例: 中瓶）
+      for (const [container, size] of Object.entries(CONTAINER_SIZES)) {
+        if (text.includes(container) && size) {
+          const unit = size.ml ? 'ml' : 'g';
+          const value = size.ml || size.g;
+          return { value, unit, raw: container };
+        }
+      }
+
+      return null; // 容量情報なし
+    };
+
+    const calcUnitPrice = (price, volume) => {
+      if (!volume || !price || volume.value === 0) return null;
+      return {
+        pricePerUnit: price / volume.value,
+        unit: volume.unit === 'g' ? '円/g' : '円/ml',
+        volume: volume
+      };
+    };
+
+    // ======================================================================
+    // ★ MODULE 3: AI プラグインスロット（Gemini API 後付け対応）
+    // ======================================================================
+    const AI_ENABLED_KEY = 'ai_enabled';
+    const AI_API_KEY_KEY = 'ai_api_key';
+
+    const aiResolveVolume = async (itemName, spec, apiKey) => {
+      // AI に聞く: 「この商品名から容量を推定して」
+      if (!apiKey) return null;
+      try {
+        const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=' + apiKey, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{ text: `飲食業界の仕入れ商品です。商品名と規格から内容量を推定してください。
+商品名: ${itemName}
+規格: ${spec || 'なし'}
+JSON形式で回答: {"value": 数値, "unit": "g"か"ml", "confidence": "high"か"medium"か"low"}
+内容量が推定できない場合: {"value": null}
+JSONのみ出力。説明不要。` }]
+            }]
+          })
+        });
+        const data = await resp.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const clean = text.replace(/```json|```/g, '').trim();
+        const parsed = JSON.parse(clean);
+        if (parsed.value) return { value: parsed.value, unit: parsed.unit, raw: 'AI推定', confidence: parsed.confidence };
+      } catch {}
+      return null;
+    };
+
+    // ======================================================================
+    // ★ MODULE 4: テストデータ内蔵
+    // ======================================================================
+    const DEMO_PREV_CSV = `商品コード,商品名,規格,取引先名,単位,数量,単価,税抜金額,自社担当者
+A001,プレミアムモルツ中瓶,334ml×30本,サントリー酒類,ケース,5,9000,45000,飲料
+A002,角瓶,700ml,サントリー酒類,本,20,1586,31720,飲料
+A003,国産鶏もも肉,1kg,丸福食品,kg,30,980,29400,料理
+A004,キャベツ,1玉,青果市場,個,50,150,7500,料理
+A005,割り箸,100膳入,包材商事,袋,10,300,3000,経費
+A006,サントリー生中瓶,334ml×30本,サントリー酒類,ケース,3,8550,25650,飲料
+A007,響ジャパニーズハーモニー,700ml,サントリー酒類,本,2,7000,14000,飲料`;
+
+    const DEMO_CURR_CSV = `商品コード,商品名,規格,取引先名,単位,数量,単価,税抜金額,自社担当者
+A001,プレミアムモルツ中瓶,334ml×30本,サントリー酒類,ケース,5,9200,46000,飲料
+A002,角瓶,700ml,サントリー酒類,本,18,1650,29700,飲料
+A003,国産鶏もも肉,1kg,丸福食品,kg,35,1050,36750,料理
+A004,キャベツ,1玉,青果市場,個,45,180,8100,料理
+A005,割り箸,100膳入,包材商事,袋,10,300,3000,経費
+A006,サントリー生中瓶,334ml×30本,サントリー酒類,ケース,4,8850,35400,飲料
+A007,響ジャパニーズハーモニー,700ml,サントリー酒類,本,3,7000,21000,飲料
+B001,白州,700ml,サントリー酒類,本,2,6600,13200,飲料`;
+
+    // ======================================================================
+    // デフォルト設定
+    // ======================================================================
+    const DEFAULT_CONFIG = {
+      specialKeywords: ['サンプル', '送料', '特別栽培', 'その他', '代替', '印刷物等'],
+      statusSortOrder: ['UP', 'DOWN', 'STAY', 'NEW'],
+      unifiedRules: [
+        { id: 'プレモル中瓶', price: 300, keys: [['プレモル', '中瓶'], ['プレミアム', 'モルツ', '中瓶'], ['香る', 'エール', '中瓶'], ['プレモル', '中']] },
+        { id: 'プレモル樽10L', price: 5900, keys: [['プレモル', '樽', '10'], ['プレミアム', 'モルツ', '樽', '10'], ['香る', 'エール', '10'], ['プレモル', '黒', '10']] },
+        { id: 'プレモル樽15L', price: 8850, keys: [['プレモル', '樽', '15'], ['プレミアム', 'モルツ', '樽', '15'], ['香る', 'エール', '15'], ['プレモル', '黒', '15']] },
+        { id: 'プレモル樽20L', price: 11800, keys: [['プレモル', '樽', '20'], ['プレミアム', 'モルツ', '樽', '20'], ['香る', 'エール', '20'], ['プレモル', '黒', '20']] },
+        { id: 'マスターズドリーム 10L', price: 6480, keys: [['マスターズドリーム', '10'], ['マストド', '10']] },
+        { id: 'マスターズドリーム 5L', price: 3240, keys: [['マスターズドリーム', '5'], ['マストド', '5']] },
+        { id: 'サントリー生 中瓶', price: 285, keys: [['サントリー生', '中瓶'], ['サントリー', '生', '中'], ['モルツ', '中瓶']] },
+        { id: 'ジムビーム 4L', price: 5400, keys: [['ジムビーム', '4']] },
+        { id: '角 700ml', price: 1586, keys: [['角', '700'], ['角瓶', '700']] },
+        { id: '角 5L', price: 9324, keys: [['角', '5'], ['角瓶', '5']] },
+        { id: '知多 700ml', price: 5300, keys: [['知多', '700']] },
+        { id: '山崎 700ml', price: 6600, keys: [['山崎', '700']] },
+        { id: '白州 700ml', price: 6600, keys: [['白州', '700']] },
+        { id: '響 700ml', price: 7000, keys: [['響', '700'], ['響', 'jh'], ['響', 'ジャパニーズ']] },
+        { id: '鏡月 4L', price: 3653, keys: [['鏡月', 'サワー', '4'], ['鏡月', '35', '4']] },
+        { id: '碧 700ml', price: 5400, keys: [['碧', '700'], ['ao', '700']] }
+      ],
+      aiEnabled: false,
+      aiApiKey: '',
+    };
+
+    // ======================================================================
+    // アイコン群（元と同一）
+    // ======================================================================
+    const Activity = ({size=28, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>;
+    const UploadCloud = ({size=24, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/><polyline points="16 16 12 12 8 16"/></svg>;
+    const Download = ({size=20, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>;
+    const ArrowUpRight = ({size=18}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg>;
+    const ArrowDownRight = ({size=18}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="7" y1="7" x2="17" y2="17"/><polyline points="17 7 17 17 7 17"/></svg>;
+    const Minus = ({size=18, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={className}><line x1="5" y1="12" x2="19" y2="12"/></svg>;
+    const AlertTriangle = ({size=24, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>;
+    const Check = ({size=20, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="20 6 9 17 4 12"/></svg>;
+    const Trash2 = ({size=20, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>;
+    const TrendingUp = ({size=20, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>;
+    const Filter = ({size=16, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>;
+    const XIcon = ({size=14, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={className}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>;
+    const Scale = ({size=16, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M16 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="M2 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="M7 21h10"/><path d="M12 3v18"/><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></svg>;
+    const LinkIcon = ({size=14, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>;
+    const UnlinkIcon = ({size=14, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="m18.84 12.25 1.72-1.71h-.01a5.001 5.001 0 0 0-7.07-7.07l-1.72 1.71v.01a5.001 5.001 0 0 0 7.08 7.06z"/><path d="m5.17 11.75-1.71 1.71a5.001 5.001 0 0 0 7.07 7.07l1.71-1.71a5.001 5.001 0 0 0-7.07-7.07z"/><line x1="1" x2="23" y1="1" y2="23"/></svg>;
+    const BookOpen = ({size=20, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>;
+    const Settings = ({size=24, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>;
+    const Save = ({size=20, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>;
+    const Plus = ({size=20, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>;
+    const ChevronUp = ({size=16}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15"/></svg>;
+    const ChevronDown = ({size=16}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg>;
+    const ListOrdered = ({size=20, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><line x1="10" y1="6" x2="21" y2="6"></line><line x1="10" y1="12" x2="21" y2="12"></line><line x1="10" y1="18" x2="21" y2="18"></line><path d="M4 6h1v4"></path><path d="M4 10h2"></path><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"></path></svg>;
+    const Beaker = ({size=16, className=""}) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M4.5 3h15"/><path d="M6 3v16a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V3"/><path d="M6 14h12"/></svg>;
+
+    // ======================================================================
+    // ユーティリティ関数（元と同一 + 改善）
+    // ======================================================================
+    const normalizeCode = (code) => {
+      if (!code) return "";
+      let s = String(code).normalize("NFKC").trim();
+      if (s.endsWith('.0')) s = s.slice(0, -2);
+      return s;
+    };
+
+    const extractNumber = (val) => {
+      if (val === undefined || val === null || val === '') return 0;
+      let str = String(val).normalize("NFKC").replace(/[^0-9.-]/g, '');
+      return parseFloat(str) || 0;
+    };
+
+    const formatPrice = (p) => {
+      if (p === undefined || p === null) return '-';
+      return `¥${Math.round(p).toLocaleString()}`;
+    };
+
+    const formatDiff = (diff) => {
+      if (diff === undefined || diff === null || isNaN(diff)) return '-';
+      const rounded = Math.round(diff);
+      if (Math.abs(rounded) === 0) return '¥0';
+      const prefix = rounded > 0 ? '+' : '';
+      return prefix + `¥${Math.abs(rounded).toLocaleString()}`;
+    };
+
+    const formatQty = (q) => {
+      if (q === undefined || q === null) return '-';
+      return Number(Math.round(q * 10) / 10).toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1});
+    };
+
+    const getSimilarity = (str1, str2) => {
+      if (!str1 || !str2) return 0;
+      if (str1 === str2) return 100;
+      const s1 = String(str1).normalize("NFKC").toLowerCase().replace(/[\s　]+/g, '');
+      const s2 = String(str2).normalize("NFKC").toLowerCase().replace(/[\s　]+/g, '');
+      if (s1 === s2) return 100;
+      const len1 = s1.length, len2 = s2.length;
+      if (len1 === 0 || len2 === 0) return 0;
+
+      const matrix = Array(len1 + 1).fill(null).map(() => Array(len2 + 1).fill(null));
+      for (let i = 0; i <= len1; i++) matrix[i][0] = i;
+      for (let j = 0; j <= len2; j++) matrix[0][j] = j;
+      for (let i = 1; i <= len1; i++) {
+        for (let j = 1; j <= len2; j++) {
+          const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+          matrix[i][j] = Math.min(matrix[i-1][j]+1, matrix[i][j-1]+1, matrix[i-1][j-1]+cost);
+        }
+      }
+      const distance = matrix[len1][len2];
+      const maxLength = Math.max(len1, len2);
+      let levenshteinScore = Math.round(((maxLength - distance) / maxLength) * 100);
+
+      let diceScore = 0;
+      if (len1 > 1 && len2 > 1) {
+        const getBigrams = (s) => { const bg = []; for(let i=0;i<s.length-1;i++) bg.push(s.substring(i,i+2)); return bg; };
+        const bg1 = getBigrams(s1), bg2 = getBigrams(s2);
+        let intersection = 0;
+        const bg2Copy = [...bg2];
+        for (let b of bg1) { const idx = bg2Copy.indexOf(b); if (idx !== -1) { intersection++; bg2Copy.splice(idx,1); } }
+        diceScore = Math.round(((2 * intersection) / (bg1.length + bg2.length)) * 100);
+      } else if (s1.includes(s2) || s2.includes(s1)) { diceScore = 80; }
+
+      let finalScore = Math.max(levenshteinScore, diceScore);
+      const extractNums = (s) => (s.match(/\d+(\.\d+)?/g) || []).join(',');
+      const num1 = extractNums(s1), num2 = extractNums(s2);
+      if (num1 && num2 && num1 !== num2) finalScore = Math.min(finalScore, 60);
+      return finalScore;
+    };
+
+    const checkUnifiedItem = (name, spec, rules) => {
+      const target = String(name + ' ' + (spec || '')).normalize("NFKC").toLowerCase().replace(/[\s　]+/g, '');
+      for (let rule of rules) {
+        for (let keySet of rule.keys) {
+          // ★ 改善: 1文字キーワードの誤マッチ防止
+          if (keySet.length === 1 && keySet[0].length <= 1) continue;
+          if (keySet.every(k => target.includes(k.toLowerCase()))) return { id: rule.id, price: rule.price };
+        }
+      }
+      return null;
+    };
+
+    const getColIndex = (headers, keywords) => {
+      for (let k of keywords) {
+        const idx = headers.findIndex(h => {
+          if (!h) return false;
+          const cleanH = String(h).normalize("NFKC").replace(/[［］\[\]\s　]/g, '');
+          const cleanK = k.normalize("NFKC").replace(/[［］\[\]\s　]/g, '');
+          return cleanH === cleanK;
+        });
+        if (idx !== -1) return idx;
+      }
+      for (let k of keywords) {
+        const idx = headers.findIndex(h => {
+          if (!h) return false;
+          const cleanH = String(h).normalize("NFKC").replace(/[［］\[\]\s　]/g, '');
+          const cleanK = k.normalize("NFKC").replace(/[［］\[\]\s　]/g, '');
+          return cleanH.includes(cleanK);
+        });
+        if (idx !== -1) return idx;
+      }
+      return -1;
+    };
+
+    // ★ PapaParse を使った堅牢なCSV解析
+    const parseCSV = (text) => {
+      // BOM除去
+      const cleanText = text.replace(/^\uFEFF/, '');
+      const result = Papa.parse(cleanText, {
+        skipEmptyLines: 'greedy',
+        dynamicTyping: false,
+      });
+      return result.data.filter(row => row.some(val => val && String(val).trim() !== ''));
+    };
+
+    // ★ IndexedDB ベースの状態管理
+    const loadLocalState = async () => {
+      const data = await idbGet(STORE_STATES, 'main');
+      return data || {};
+    };
+
+    const saveLocalState = async (results) => {
+      const state = await loadLocalState();
+      results.forEach(r => {
+        state[r.itemCode] = {
+          confirmed: r.confirmed,
+          isLinked: r.isLinked,
+          linkedFromCode: r.linkedFrom ? r.linkedFrom.code : null,
+        };
+      });
+      await idbSet(STORE_STATES, 'main', state);
+    };
+
+    // ======================================================================
+    // 設定モーダル（元と同一構造 + AI設定・Export/Import追加）
+    // ======================================================================
+    const ConfigModal = ({ isOpen, onClose, initialConfig, onSave }) => {
+      const [localConfig, setLocalConfig] = useState(null);
+      const fileInputRef = useRef(null);
+
+      useEffect(() => {
+        if (isOpen && initialConfig) {
+          const conf = JSON.parse(JSON.stringify(initialConfig));
+          conf.specialKeywordsText = conf.specialKeywords.join(', ');
+          conf.statusSortOrder = conf.statusSortOrder || ['UP', 'DOWN', 'STAY', 'NEW'];
+          conf.unifiedRules = conf.unifiedRules.map(r => ({
+            ...r,
+            keysText: r.keys.map(k => k.join(',')).join('\n')
+          }));
+          setLocalConfig(conf);
+        }
+      }, [isOpen, initialConfig]);
+
+      if (!isOpen || !localConfig) return null;
+
+      const handleSave = () => {
+        const finalConfig = {
+          specialKeywords: localConfig.specialKeywordsText.split(',').map(s => s.trim()).filter(Boolean),
+          statusSortOrder: localConfig.statusSortOrder,
+          unifiedRules: localConfig.unifiedRules.map(r => ({
+            id: r.id,
+            price: Number(r.price) || 0,
+            keys: r.keysText.split('\n').map(line => line.split(',').map(s => s.trim()).filter(Boolean)).filter(arr => arr.length > 0)
+          })),
+          aiEnabled: localConfig.aiEnabled || false,
+          aiApiKey: localConfig.aiApiKey || '',
+        };
+        onSave(finalConfig);
+      };
+
+      const moveOrder = (index, direction) => {
+        const newOrder = [...localConfig.statusSortOrder];
+        if (direction === 'up' && index > 0) [newOrder[index-1], newOrder[index]] = [newOrder[index], newOrder[index-1]];
+        else if (direction === 'down' && index < newOrder.length - 1) [newOrder[index+1], newOrder[index]] = [newOrder[index], newOrder[index+1]];
+        setLocalConfig({...localConfig, statusSortOrder: newOrder});
+      };
+
+      // ★ 設定エクスポート
+      const handleExport = () => {
+        const exportData = {
+          _version: 'monthtracker_config_v2',
+          _exportedAt: new Date().toISOString(),
+          specialKeywords: localConfig.specialKeywordsText.split(',').map(s => s.trim()).filter(Boolean),
+          statusSortOrder: localConfig.statusSortOrder,
+          unifiedRules: localConfig.unifiedRules.map(r => ({
+            id: r.id, price: Number(r.price) || 0,
+            keys: r.keysText.split('\n').map(line => line.split(',').map(s => s.trim()).filter(Boolean)).filter(arr => arr.length > 0)
+          })),
+        };
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `月トラ設定_${new Date().toISOString().split('T')[0]}.json`;
+        link.click();
+      };
+
+      // ★ 設定インポート
+      const handleImport = (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          try {
+            const data = JSON.parse(ev.target.result);
+            if (data._version !== 'monthtracker_config_v2') { alert('このファイルは月トラの設定ファイルではないようです。'); return; }
+            setLocalConfig({
+              ...localConfig,
+              specialKeywordsText: (data.specialKeywords || []).join(', '),
+              statusSortOrder: data.statusSortOrder || ['UP', 'DOWN', 'STAY', 'NEW'],
+              unifiedRules: (data.unifiedRules || []).map(r => ({ ...r, keysText: r.keys.map(k => k.join(',')).join('\n') })),
+            });
+            alert('設定を読み込みました！「設定を保存」ボタンを押すと反映されます。');
+          } catch { alert('設定ファイルの読み込みに失敗しました。'); }
+        };
+        reader.readAsText(file);
+      };
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-2 md:p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[95vh] flex flex-col overflow-hidden border border-slate-200">
+            <div className="p-3 md:p-4 border-b border-bordercol flex justify-between items-center bg-slate-50">
+              <h3 className="font-black text-textmain flex items-center gap-2">
+                <Settings size={20} className="text-brand" /> システム設定
+              </h3>
+              <button onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-200 rounded-md transition-colors"><XIcon size={20}/></button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-3 md:p-5 bg-slate-50 space-y-4 md:space-y-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
+                {/* 特別扱いキーワード */}
+                <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                  <h4 className="font-black text-textmain mb-1 flex items-center gap-2"><Minus size={16} className="text-orange-500"/> 自動計算から外すキーワード</h4>
+                  <p className="text-[10px] md:text-xs text-textmuted mb-3 leading-relaxed">カンマ(,)区切り。これらが名前に含まれる商品は、単価ではなく「総額の増減」で特別計算されます。</p>
+                  <textarea value={localConfig.specialKeywordsText} onChange={e => setLocalConfig({...localConfig, specialKeywordsText: e.target.value})} className="w-full h-24 text-xs md:text-sm border-2 border-slate-200 rounded-lg p-3 outline-none focus:border-brand transition-colors font-bold text-slate-700" placeholder="サンプル, 送料, 特別栽培..."/>
+                </div>
+
+                {/* 並び順設定 */}
+                <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                  <h4 className="font-black text-textmain mb-1 flex items-center gap-2"><ListOrdered size={16} className="text-brand"/> リストの並び順 (優先度)</h4>
+                  <p className="text-[10px] md:text-xs text-textmuted mb-3 leading-relaxed">上にあるものほど、チェックリストの上部に表示されます。</p>
+                  <div className="space-y-2">
+                    {localConfig.statusSortOrder.map((status, index) => (
+                      <div key={status} className="flex items-center justify-between bg-slate-50 p-2 rounded-lg border border-slate-200 shadow-sm">
+                        <div className="flex items-center gap-2 text-sm font-bold">
+                          <span className="text-slate-400 w-4 text-right mr-1">{index + 1}.</span>
+                          {status === 'UP' && <span className="text-up flex items-center gap-1 bg-red-100 px-2 py-0.5 rounded"><ArrowUpRight size={14}/> 値上げ</span>}
+                          {status === 'DOWN' && <span className="text-down flex items-center gap-1 bg-emerald-100 px-2 py-0.5 rounded"><ArrowDownRight size={14}/> 値下げ</span>}
+                          {status === 'STAY' && <span className="text-slate-600 flex items-center gap-1 bg-slate-200 px-2 py-0.5 rounded"><Minus size={14}/> 維持</span>}
+                          {status === 'NEW' && <span className="text-orange-600 flex items-center gap-1 bg-orange-100 px-2 py-0.5 rounded"><Plus size={14}/> 新規</span>}
+                        </div>
+                        <div className="flex flex-col gap-0.5">
+                          <button disabled={index === 0} onClick={() => moveOrder(index, 'up')} className="px-2 py-0.5 text-slate-400 hover:text-brand disabled:opacity-30 bg-white border border-slate-200 rounded transition-colors"><ChevronUp size={14}/></button>
+                          <button disabled={index === localConfig.statusSortOrder.length - 1} onClick={() => moveOrder(index, 'down')} className="px-2 py-0.5 text-slate-400 hover:text-brand disabled:opacity-30 bg-white border border-slate-200 rounded transition-colors"><ChevronDown size={14}/></button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* ★ AI設定パネル */}
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                <h4 className="font-black text-textmain mb-1 flex items-center gap-2">
+                  <Beaker size={16} className="text-purple-500"/> AI容量推定（オプション）
+                </h4>
+                <p className="text-[10px] md:text-xs text-textmuted mb-3 leading-relaxed">
+                  Gemini APIキーを設定すると、商品名から容量を自動推定できます。<strong>なくても基本機能は全て動きます。</strong>
+                </p>
+                <div className="flex items-center gap-3 mb-3">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={localConfig.aiEnabled || false} onChange={e => setLocalConfig({...localConfig, aiEnabled: e.target.checked})} className="w-4 h-4 rounded border-slate-300 text-purple-500" />
+                    <span className="text-sm font-bold">AI推定を有効にする</span>
+                  </label>
+                </div>
+                {localConfig.aiEnabled && (
+                  <input type="password" value={localConfig.aiApiKey || ''} onChange={e => setLocalConfig({...localConfig, aiApiKey: e.target.value})} placeholder="Gemini APIキーを入力..." className="w-full text-sm border-2 border-purple-200 rounded-lg p-2 outline-none focus:border-purple-500 font-mono"/>
+                )}
+              </div>
+
+              {/* 統一価格ルール */}
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                <div className="flex flex-col md:flex-row justify-between md:items-end mb-4 gap-3">
+                  <div>
+                    <h4 className="font-black text-textmain mb-1 flex items-center gap-2"><BookOpen size={16} className="text-blue-500"/> 全店統一価格ルール</h4>
+                    <p className="text-[10px] md:text-xs text-textmuted leading-relaxed">商品名や規格に特定のキーワードが両方含まれていた場合、指定した単価を自動適用します。<br/><span className="font-bold text-blue-600">入力ルール：</span> 1行に入力した言葉は「すべて含む（AND）」、改行すると「または（OR）」になります。</p>
+                  </div>
+                  <button onClick={() => setLocalConfig({...localConfig, unifiedRules: [{id: '新しいルール', price: 0, keysText: 'キーワード1, キーワード2'}, ...localConfig.unifiedRules]})} className="flex items-center justify-center gap-1 bg-brand text-white px-3 py-2 md:py-1.5 rounded-lg text-xs font-bold hover:bg-blue-600 transition-colors shadow-sm whitespace-nowrap"><Plus size={14} /> ルールを追加</button>
+                </div>
+                <div className="space-y-3">
+                  {localConfig.unifiedRules.map((rule, idx) => (
+                    <div key={idx} className="flex flex-col md:flex-row gap-3 p-3 bg-slate-50 border border-slate-200 rounded-lg relative group">
+                      <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div className="space-y-3">
+                          <div>
+                            <label className="block text-[10px] font-bold text-slate-500 mb-1">ルール名 (表示用)</label>
+                            <input type="text" value={rule.id} onChange={e => { const nr = [...localConfig.unifiedRules]; nr[idx].id = e.target.value; setLocalConfig({...localConfig, unifiedRules: nr}); }} className="w-full text-sm font-bold border border-slate-200 rounded p-2 focus:border-brand outline-none text-slate-700"/>
+                          </div>
+                          <div>
+                            <label className="block text-[10px] font-bold text-slate-500 mb-1">適用する単価 (円)</label>
+                            <input type="number" value={rule.price} onChange={e => { const nr = [...localConfig.unifiedRules]; nr[idx].price = e.target.value; setLocalConfig({...localConfig, unifiedRules: nr}); }} className="w-full text-sm font-black border border-slate-200 rounded p-2 focus:border-brand outline-none text-brand bg-blue-50/30"/>
+                          </div>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-500 mb-1">判定キーワード条件</label>
+                          <textarea value={rule.keysText} onChange={e => { const nr = [...localConfig.unifiedRules]; nr[idx].keysText = e.target.value; setLocalConfig({...localConfig, unifiedRules: nr}); }} className="w-full h-24 text-xs font-mono font-bold text-slate-600 border border-slate-200 rounded p-2 focus:border-brand outline-none bg-white whitespace-pre" placeholder={"プレモル,中瓶\nプレミアム,モルツ,中瓶"}/>
+                        </div>
+                      </div>
+                      <button onClick={() => { if(!confirm(`「${rule.id}」のルールを削除してよろしいですか？`)) return; const nr = [...localConfig.unifiedRules]; nr.splice(idx, 1); setLocalConfig({...localConfig, unifiedRules: nr}); }} className="self-end md:self-center p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors border border-transparent hover:border-red-200" title="このルールを削除"><Trash2 size={18} /></button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* ★ 設定 Export / Import */}
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                <h4 className="font-black text-textmain mb-3 flex items-center gap-2"><Download size={16} className="text-emerald-500"/> 設定のバックアップ・共有</h4>
+                <div className="flex flex-wrap gap-3">
+                  <button onClick={handleExport} className="flex items-center gap-1 px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-bold hover:bg-emerald-100 transition-colors"><Download size={14}/> 設定をファイルに保存</button>
+                  <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1 px-3 py-2 bg-blue-50 text-blue-700 border border-blue-200 rounded-lg text-xs font-bold hover:bg-blue-100 transition-colors"><UploadCloud size={14}/> 設定ファイルを読み込む</button>
+                  <input ref={fileInputRef} type="file" accept=".json" onChange={handleImport} className="hidden"/>
+                </div>
+                <p className="text-[10px] text-textmuted mt-2">他の店舗に同じ設定を配布する時に使えます。統一価格ルールやキーワード設定がそのまま共有できます。</p>
+              </div>
+            </div>
+
+            <div className="p-3 md:p-4 border-t border-bordercol bg-white flex justify-between items-center">
+              <button onClick={() => { if(confirm("設定をすべて初期状態にリセットしてよろしいですか？\n※自作したルールはすべて消えます。")) onSave(DEFAULT_CONFIG); }} className="text-xs font-bold text-slate-400 hover:text-slate-600 underline">デフォルトに戻す</button>
+              <div className="flex gap-2">
+                <button onClick={onClose} className="px-3 md:px-4 py-2 bg-slate-100 text-slate-600 rounded-lg font-bold text-xs md:text-sm hover:bg-slate-200 transition-colors">キャンセル</button>
+                <button onClick={handleSave} className="px-3 md:px-4 py-2 bg-brand text-white rounded-lg font-bold text-xs md:text-sm hover:bg-blue-600 transition-colors shadow-sm flex items-center gap-1"><Save size={16}/> 設定を保存</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    // ======================================================================
+    // メインアプリ
+    // ======================================================================
+    function App() {
+      const [prevFile, setPrevFile] = useState(null);
+      const [currFile, setCurrFile] = useState(null);
+      const [nextFile, setNextFile] = useState(null);
+      const [results, setResults] = useState([]);
+      const [prevItemsList, setPrevItemsList] = useState([]);
+      const [linkModal, setLinkModal] = useState({ isOpen: false, targetItem: null, searchQuery: '' });
+
+      const [config, setConfig] = useState(DEFAULT_CONFIG);
+      const [configLoaded, setConfigLoaded] = useState(false);
+      const [isConfigOpen, setIsConfigOpen] = useState(false);
+      const [isCalculating, setIsCalculating] = useState(false);
+      const [message, setMessage] = useState({ type: '', text: '' });
+      const [activeTab, setActiveTab] = useState('ALL');
+      const [showOnlyChanges, setShowOnlyChanges] = useState(false);
+      const [supplierQuery, setSupplierQuery] = useState('');
+      const [itemQuery, setItemQuery] = useState('');
+      const [diagnostics, setDiagnostics] = useState(null);
+      const [currTotalAmounts, setCurrTotalAmounts] = useState({ 'ALL': 0, '料理': 0, '飲料': 0, '経費': 0 });
+      const [viewMode, setViewMode] = useState('ACTUAL');
+      const [priceMode, setPriceMode] = useState('LATEST');
+      const [highlightedId, setHighlightedId] = useState(null);
+
+      // ★ 起動時: IndexedDBから設定読み込み + localStorage移行
+      useEffect(() => {
+        (async () => {
+          await migrateFromLocalStorage();
+          const saved = await idbGet(STORE_CONFIG, 'main');
+          if (saved) setConfig({ ...DEFAULT_CONFIG, ...saved });
+          setConfigLoaded(true);
+        })();
+      }, []);
+
+      const handleSaveConfig = async (newConfig) => {
+        setConfig(newConfig);
+        await idbSet(STORE_CONFIG, 'main', newConfig);
+        setIsConfigOpen(false);
+        setMessage({ type: 'success', text: '設定を保存したよ！反映させるには、もう一度「価格変動をチェック」ボタンを押してね！' });
+      };
+
+      const updateResultsAndSave = (action) => {
+        setResults(prev => {
+          const next = action(prev);
+          saveLocalState(next); // async but fire-and-forget
+          return next;
+        });
+      };
+
+      const handleExclude = (id) => updateResultsAndSave(prev => prev.filter(r => r.id !== id));
+      const handleConfirm = (id) => updateResultsAndSave(prev => prev.map(r => r.id === id ? { ...r, confirmed: !r.confirmed } : r));
+
+      const applyLinkingLogic = (r, prevItem, baseOldPrice) => {
+        const avgOldPrice = prevItem.qty > 0 ? prevItem.totalAmount / prevItem.qty : baseOldPrice;
+        const baseDiff = r.baseNewPrice - baseOldPrice;
+        const baseImpact = baseDiff * r.qty;
+        const baseRate = baseOldPrice > 0 ? (r.baseNewPrice / baseOldPrice - 1) * 100 : 0;
+        let baseStatus = 'STAY';
+        if (baseDiff > 0) baseStatus = 'UP'; else if (baseDiff < 0) baseStatus = 'DOWN';
+        const avgDiff = r.avgNewPrice - avgOldPrice;
+        const avgImpact = avgDiff * r.qty;
+        const avgRate = avgOldPrice > 0 ? (r.avgNewPrice / avgOldPrice - 1) * 100 : 0;
+        let avgStatus = 'STAY';
+        if (avgDiff > 0.01) avgStatus = 'UP'; else if (avgDiff < -0.01) avgStatus = 'DOWN';
+        return { ...r, baseOldPrice, baseDiff, baseImpact, baseRate, baseStatus, avgOldPrice, avgDiff, avgImpact, avgRate, avgStatus, isLinked: true, linkedFrom: prevItem, suggestedLink: null };
+      };
+
+      const handleApplyLink = (prevItem) => {
+        const targetId = linkModal.targetItem.id;
+        updateResultsAndSave(prev => prev.map(r => r.id === targetId ? applyLinkingLogic(r, prevItem, prevItem.price) : r));
+        setLinkModal({ isOpen: false, targetItem: null, searchQuery: '' });
+        setHighlightedId(targetId);
+        setTimeout(() => setHighlightedId(null), 3000);
+      };
+
+      const handleAcceptSuggestion = (id, prevItem) => {
+        updateResultsAndSave(prev => prev.map(r => r.id === id ? applyLinkingLogic(r, prevItem, prevItem.price) : r));
+        setHighlightedId(id);
+        setTimeout(() => setHighlightedId(null), 3000);
+      };
+
+      const handleRejectSuggestion = (id) => {
+        updateResultsAndSave(prev => prev.map(r => r.id === id ? { ...r, suggestedLink: null } : r));
+      };
+
+      const handleUnlink = (id) => {
+        updateResultsAndSave(prev => prev.map(r => {
+          if (r.id !== id || !r.isLinked) return r;
+          const baseDiff = r.baseNewPrice - r.originalBaseOldPrice;
+          const baseImpact = baseDiff * r.qty;
+          const baseRate = r.originalBaseOldPrice > 0 ? (r.baseNewPrice / r.originalBaseOldPrice - 1) * 100 : 0;
+          let baseStatus = 'STAY';
+          if (r.originalBaseOldPrice === 0) baseStatus = 'NEW';
+          else if (baseDiff > 0) baseStatus = 'UP'; else if (baseDiff < 0) baseStatus = 'DOWN';
+          const avgDiff = r.avgNewPrice - r.originalAvgOldPrice;
+          const avgImpact = avgDiff * r.qty;
+          const avgRate = r.originalAvgOldPrice > 0 ? (r.avgNewPrice / r.originalAvgOldPrice - 1) * 100 : 0;
+          let avgStatus = 'STAY';
+          if (r.originalAvgOldPrice === 0) avgStatus = 'NEW';
+          else if (avgDiff > 0.01) avgStatus = 'UP'; else if (avgDiff < -0.01) avgStatus = 'DOWN';
+          return { ...r, baseOldPrice: r.originalBaseOldPrice, baseDiff, baseImpact, baseRate, baseStatus, avgOldPrice: r.originalAvgOldPrice, avgDiff, avgImpact, avgRate, avgStatus, isLinked: false, linkedFrom: null };
+        }));
+      };
+
+      const uniqueSuppliers = useMemo(() => {
+        const filteredByTab = results.filter(r => activeTab === 'ALL' || r.category === activeTab);
+        const suppliers = new Set(filteredByTab.map(r => r.supplier).filter(s => s && s !== '（不明）'));
+        return Array.from(suppliers).sort();
+      }, [results, activeTab]);
+
+      // ★ デモデータでテスト実行
+      const handleDemoTest = () => {
+        const prevBlob = new Blob([DEMO_PREV_CSV], { type: 'text/csv' });
+        const currBlob = new Blob([DEMO_CURR_CSV], { type: 'text/csv' });
+        setPrevFile(new File([prevBlob], 'demo_prev.csv', { type: 'text/csv' }));
+        setCurrFile(new File([currBlob], 'demo_curr.csv', { type: 'text/csv' }));
+        setNextFile(null);
+        setMessage({ type: 'success', text: 'テストデータをセットしました！「価格変動をチェック」ボタンを押してください。' });
+      };
+
+      const analyzeOrderData = (data, diagRef) => {
+        diagRef.totalRows = data.length;
+        let headerIdx = data.findIndex(r => r.some(c => c && typeof c === 'string' && c.includes('商品名')));
+        if (headerIdx === -1) throw new Error("ファイルの中に「商品名」という列が見つからないよ。違うファイルを選んでいないか確認して！");
+        const headers = data[headerIdx];
+
+        const col = {
+          name: getColIndex(headers, ['商品名']),
+          supplier: getColIndex(headers, ['取引先名', '仕入先']),
+          qty: getColIndex(headers, ['数量', '発注数']),
+          unit: getColIndex(headers, ['単位', '発注単位']),
+          itemCode: getColIndex(headers, ['自社管理商品コード', '商品コード']),
+          spec: getColIndex(headers, ['規格']),
+          price: getColIndex(headers, ['単価', '発注単価']),
+          amount: getColIndex(headers, ['税抜金額', '純金額', '納品金額', '発注金額', '金額', '合計']),
+          category: getColIndex(headers, ['自社担当者', 'カテゴリ', '分類', '部門', '大分類', '中分類']),
+          shop: getColIndex(headers, ['納品場所名', '店舗名'])
+        };
+
+        const map = new Map();
+        const totals = { 'ALL': 0, '料理': 0, '飲料': 0, '経費': 0 };
+
+        for (let i = headerIdx + 1; i < data.length; i++) {
+          const r = data[i];
+          if (!r[col.name]) continue;
+
+          let category = "経費";
+          const rawCat = col.category !== -1 ? (String(r[col.category] || "")) : "";
+          const rawName = String(r[col.name] || "");
+
+          if (rawCat.includes("料理") || rawCat.includes("食品") || rawCat.includes("食材") || rawCat.includes("フード")) category = "料理";
+          else if (rawCat.includes("飲物") || rawCat.includes("飲料") || rawCat.includes("ドリンク") || rawCat.includes("酒") || rawCat.includes("アルコール")) category = "飲料";
+          else if (rawCat.includes("経費") || rawCat.includes("消耗品") || rawCat.includes("備品") || rawCat.includes("包材")) category = "経費";
+          else {
+            if (rawName.includes("飲物") || rawName.includes("飲料") || rawName.includes("ドリンク") || rawName.includes("酒") || rawName.includes("ビール") || rawName.includes("ワイン") || rawName.includes("ジュース")) category = "飲料";
+            else if (rawName.includes("肉") || rawName.includes("魚") || rawName.includes("野菜") || rawName.includes("米") || rawName.includes("麺")) category = "料理";
+          }
+
+          const qty = col.qty !== -1 ? Math.round(extractNumber(r[col.qty]) * 1000) / 1000 : 0;
+          const price = col.price !== -1 ? extractNumber(r[col.price]) : 0;
+          let amount = qty * price;
+          if (col.amount !== -1 && r[col.amount] !== '' && r[col.amount] !== undefined) {
+            const parsedAmount = extractNumber(r[col.amount]);
+            if (parsedAmount !== 0 || amount === 0) amount = parsedAmount;
+          }
+
+          totals['ALL'] += amount;
+          totals[category] += amount;
+
+          let actualCode = col.itemCode !== -1 ? normalizeCode(r[col.itemCode]) : '';
+          let mapCode = actualCode ? actualCode : `NO_CODE_${r[col.name]}_${col.supplier !== -1 ? r[col.supplier] : '不明'}`;
+
+          if (!map.has(mapCode)) {
+            map.set(mapCode, {
+              code: mapCode, actualCode, name: r[col.name], supplier: col.supplier !== -1 ? r[col.supplier] : '',
+              spec: col.spec !== -1 ? r[col.spec] : '', category, shop: col.shop !== -1 ? r[col.shop] : '不明店舗',
+              unit: col.unit !== -1 ? r[col.unit] : '',
+              qty: 0, price: 0, totalAmount: 0, prices: []
+            });
+          }
+          const item = map.get(mapCode);
+          item.qty += qty;
+          item.totalAmount += amount;
+          if (price > 0) item.prices.push(price);
+        }
+
+        map.forEach(item => {
+          if (item.prices.length > 0) {
+            const counts = {};
+            let maxCount = 0, modePrice = item.prices[0];
+            item.prices.forEach(p => { counts[p] = (counts[p] || 0) + 1; if (counts[p] > maxCount) { maxCount = counts[p]; modePrice = p; } });
+            item.price = modePrice;
+          }
+        });
+
+        diagRef.validItems = map.size;
+        return { map, totals };
+      };
+
+      const analyzePriceListData = (data) => {
+        let headerIdx = data.findIndex(r => r.some(c => c && typeof c === 'string' && (c.includes('商品名') || c.includes('品名'))));
+        if (headerIdx === -1) return [];
+        const headers = data[headerIdx];
+        const col = {
+          name: getColIndex(headers, ['商品名', '品名']),
+          spec: getColIndex(headers, ['規格']),
+          itemCode: getColIndex(headers, ['自社管理商品コード', '商品コード', '品番']),
+          price: getColIndex(headers, ['新単価', '改定後単価', '新価格', '単価', '価格']),
+          supplier: getColIndex(headers, ['取引先名', '仕入先'])
+        };
+        const list = [];
+        for (let i = headerIdx + 1; i < data.length; i++) {
+          const r = data[i];
+          if (!r[col.name]) continue;
+          const candName = String(r[col.name]).normalize("NFKC").trim();
+          const candSpec = col.spec !== -1 && r[col.spec] ? String(r[col.spec]).normalize("NFKC").trim() : '';
+          const candSupplier = col.supplier !== -1 && r[col.supplier] ? String(r[col.supplier]).normalize("NFKC").trim() : '';
+          const candCode = col.itemCode !== -1 && r[col.itemCode] ? normalizeCode(r[col.itemCode]) : '';
+          const price = col.price !== -1 ? extractNumber(r[col.price]) : 0;
+          if (price > 0) list.push({ code: candCode, name: candName, spec: candSpec, supplier: candSupplier, price });
+        }
+        return list;
+      };
+
+      const handleCalculate = async () => {
+        if (!prevFile || !currFile) { setMessage({ type: 'error', text: '前月と当月のファイルを両方セットしてくれ！' }); return; }
+        setIsCalculating(true);
+        setMessage({ type: '', text: '' });
+        setResults([]);
+        setDiagnostics(null);
+        setSupplierQuery('');
+        setItemQuery('');
+
+        try {
+          // ★ PapaParse + Shift-JIS フォールバック
+          const smartParse = async (file) => {
+            const buffer = await new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = e => resolve(e.target.result);
+              reader.onerror = e => reject(e);
+              reader.readAsArrayBuffer(file);
+            });
+            let text = new TextDecoder('utf-8').decode(buffer);
+            if (!text.includes('商品名') && !text.includes('単価')) {
+              text = new TextDecoder('shift_jis').decode(buffer);
+            }
+            return parseCSV(text);
+          };
+
+          const prevData = await smartParse(prevFile);
+          const currData = await smartParse(currFile);
+          let nextItems = [];
+          if (nextFile) {
+            const nextData = await smartParse(nextFile);
+            nextItems = analyzePriceListData(nextData);
+          }
+
+          const diag = { prevTotalRows: 0, prevValidItems: 0, currTotalRows: 0, currValidItems: 0, matchedCodes: 0, validPrices: 0, nextMatchedCodes: 0, volumeResolved: 0 };
+          const prevDiagRef = {}, currDiagRef = {};
+          const { map: prevMap } = analyzeOrderData(prevData, prevDiagRef);
+          const { map: currMap, totals: currTotals } = analyzeOrderData(currData, currDiagRef);
+
+          diag.prevTotalRows = prevDiagRef.totalRows;
+          diag.prevValidItems = prevDiagRef.validItems;
+          diag.currTotalRows = currDiagRef.totalRows;
+          diag.currValidItems = currDiagRef.validItems;
+
+          const prevListForLinks = [];
+          prevMap.forEach((item, code) => prevListForLinks.push({ ...item, code }));
+          setPrevItemsList(prevListForLinks);
+
+          let calculatedResults = [];
+
+          currMap.forEach((currItem, mapCode) => {
+            const isSpecial = config.specialKeywords.some(keyword => currItem.name.includes(keyword));
+            const prevItem = prevMap.get(mapCode);
+
+            // ★ 容量正規化エンジン適用
+            const currVolume = extractVolume(`${currItem.name} ${currItem.spec || ''}`);
+            const prevVolume = prevItem ? extractVolume(`${prevItem.name} ${prevItem.spec || ''}`) : null;
+            let volumeUnitPrice = null;
+            if (currVolume) {
+              volumeUnitPrice = calcUnitPrice(currItem.price, currVolume);
+              if (volumeUnitPrice) diag.volumeResolved++;
+            }
+
+            let suggestedLink = null, suggestedLinkScore = 0;
+
+            if (!prevItem && !isSpecial) {
+              const currentSupplier = (currItem.supplier || '').normalize("NFKC").trim();
+              let bestPrevScore = 0, bestPrevMatch = null;
+              prevListForLinks.forEach(p => {
+                if (!currMap.has(p.code)) {
+                  const nameScore = getSimilarity(currItem.name, p.name);
+                  if (nameScore >= 60) {
+                    const targetStr = `${currItem.name} ${currItem.spec || ''}`.trim();
+                    const candStr = `${p.name} ${p.spec || ''}`.trim();
+                    const fullScore = getSimilarity(targetStr, candStr);
+                    let supplierBonus = 0;
+                    const pSup = (p.supplier || '').normalize("NFKC").trim();
+                    if (currentSupplier && pSup && (currentSupplier.includes(pSup) || pSup.includes(currentSupplier))) supplierBonus = 15;
+                    let totalScore = Math.round((nameScore * 0.7) + (fullScore * 0.3)) + supplierBonus;
+                    if (totalScore > 100) totalScore = 100;
+                    if (totalScore > bestPrevScore) { bestPrevScore = totalScore; bestPrevMatch = p; }
+                  }
+                }
+              });
+              if (bestPrevMatch && bestPrevScore >= 70) { suggestedLink = bestPrevMatch; suggestedLinkScore = bestPrevScore; }
+            }
+
+            const unifiedItem = checkUnifiedItem(currItem.name, currItem.spec, config.unifiedRules);
+            const unifiedTarget = unifiedItem ? unifiedItem.id : null;
+            let unifiedPrice = unifiedItem ? unifiedItem.price : 0;
+
+            let nextPrice = 0, matchScore = 0, matchedNextItemName = '', hasNextData = false;
+
+            if (unifiedPrice > 0) {
+              nextPrice = unifiedPrice; matchScore = 100;
+              matchedNextItemName = `【全店統一価格】 ${unifiedTarget}`;
+              hasNextData = true; diag.nextMatchedCodes++;
+            } else if (nextItems.length > 0 && !isSpecial) {
+              const currActualCode = currItem.actualCode;
+              let bestScore = 0, bestMatch = null;
+              if (currActualCode) {
+                const exactMatch = nextItems.find(n => n.code && n.code === currActualCode);
+                if (exactMatch) { bestMatch = exactMatch; bestScore = 100; }
+              }
+              if (!bestMatch) {
+                nextItems.forEach(cand => {
+                  const nameScore = getSimilarity(currItem.name, cand.name);
+                  if (nameScore < 70) return;
+                  const targetStr = `${currItem.name} ${currItem.spec || ''}`.trim();
+                  const candStr = `${cand.name} ${cand.spec || ''}`.trim();
+                  const fullScore = getSimilarity(targetStr, candStr);
+                  let totalScore = Math.round((nameScore * 0.8) + (fullScore * 0.2));
+                  if (totalScore > 100) totalScore = 100;
+                  if (totalScore > bestScore) { bestScore = totalScore; bestMatch = cand; }
+                });
+              }
+              if (bestMatch && bestScore >= 70) {
+                nextPrice = bestMatch.price; matchScore = bestScore;
+                matchedNextItemName = `${bestMatch.name} ${bestMatch.spec || ''}`.trim();
+                hasNextData = true; diag.nextMatchedCodes++;
+              }
+            }
+
+            const baseOldPrice = prevItem ? prevItem.price : 0;
+            const baseNewPrice = currItem.price;
+            const avgOldPrice = prevItem && prevItem.qty > 0 ? prevItem.totalAmount / prevItem.qty : baseOldPrice;
+            const avgNewPrice = currItem.qty > 0 ? currItem.totalAmount / currItem.qty : baseNewPrice;
+
+            if (isSpecial) {
+              const oldAmount = prevItem ? prevItem.totalAmount : 0;
+              const newAmount = currItem.totalAmount;
+              const amountDiff = newAmount - oldAmount;
+              let status = 'NEW';
+              if (prevItem) { if (amountDiff > 0) status = 'UP'; else if (amountDiff < 0) status = 'DOWN'; else status = 'STAY'; }
+              const rate = prevItem && oldAmount !== 0 ? ((newAmount / oldAmount) - 1) * 100 : 0;
+              calculatedResults.push({
+                id: Math.random().toString(36).substr(2, 9),
+                shop: currItem.shop, category: currItem.category, supplier: currItem.supplier,
+                itemName: currItem.name, spec: currItem.spec, itemCode: mapCode, unit: currItem.unit,
+                qty: currItem.qty, amount: newAmount,
+                baseOldPrice: oldAmount, baseNewPrice: newAmount, baseDiff: amountDiff, baseImpact: amountDiff, baseRate: rate, baseStatus: status,
+                avgOldPrice: oldAmount, avgNewPrice: newAmount, avgDiff: amountDiff, avgImpact: amountDiff, avgRate: rate, avgStatus: status,
+                originalBaseOldPrice: oldAmount, originalAvgOldPrice: oldAmount,
+                nextPrice: 0, nextBaseDiff: 0, nextBaseImpact: 0, nextBaseStatus: '-',
+                nextAvgDiff: 0, nextAvgImpact: 0, nextAvgStatus: '-',
+                matchScore: 0, matchedNextItemName: '',
+                isSpecial: true, confirmed: false, hasNextData: false, isLinked: false, linkedFrom: null,
+                suggestedLink: null, suggestedLinkScore: 0,
+                volumeUnitPrice: null, unifiedTarget: null,
+              });
+            } else {
+              const buildResult = (bOld, bNew, bDiff, bImpact, bRate, bStatus, aOld, aNew, aDiff, aImpact, aRate, aStatus, status) => {
+                let nextBaseDiff = 0, nextBaseImpact = 0, nextBaseStatus = '-';
+                let nextAvgDiff = 0, nextAvgImpact = 0, nextAvgStatus = '-';
+                if (hasNextData) {
+                  nextBaseDiff = nextPrice - bNew; nextBaseImpact = nextBaseDiff * currItem.qty;
+                  if (nextBaseDiff > 0) nextBaseStatus = 'UP'; else if (nextBaseDiff < 0) nextBaseStatus = 'DOWN'; else nextBaseStatus = 'STAY';
+                  nextAvgDiff = nextPrice - aNew; nextAvgImpact = nextAvgDiff * currItem.qty;
+                  if (nextAvgDiff > 0.01) nextAvgStatus = 'UP'; else if (nextAvgDiff < -0.01) nextAvgStatus = 'DOWN'; else nextAvgStatus = 'STAY';
+                }
+                return {
+                  id: Math.random().toString(36).substr(2, 9),
+                  shop: currItem.shop, category: currItem.category, supplier: currItem.supplier,
+                  itemName: currItem.name, spec: currItem.spec, itemCode: mapCode, unit: currItem.unit,
+                  qty: currItem.qty, amount: currItem.totalAmount,
+                  baseOldPrice: bOld, baseNewPrice: bNew, baseDiff: bDiff, baseImpact: bImpact, baseRate: bRate, baseStatus: bStatus,
+                  avgOldPrice: aOld, avgNewPrice: aNew, avgDiff: aDiff, avgImpact: aImpact, avgRate: aRate, avgStatus: aStatus,
+                  originalBaseOldPrice: bOld, originalAvgOldPrice: aOld,
+                  nextPrice, nextBaseDiff, nextBaseImpact, nextBaseStatus, nextAvgDiff, nextAvgImpact, nextAvgStatus,
+                  matchScore, matchedNextItemName,
+                  isSpecial: false, confirmed: false, hasNextData, isLinked: false, linkedFrom: null,
+                  suggestedLink, suggestedLinkScore,
+                  volumeUnitPrice, unifiedTarget,
+                };
+              };
+
+              if (prevItem && prevItem.price > 0 && currItem.price > 0) {
+                diag.matchedCodes++; diag.validPrices++;
+                const baseDiff = baseNewPrice - baseOldPrice;
+                const baseImpact = baseDiff * currItem.qty;
+                const baseRate = baseOldPrice > 0 ? (baseNewPrice / baseOldPrice - 1) * 100 : 0;
+                let baseStatus = 'STAY';
+                if (baseDiff > 0) baseStatus = 'UP'; else if (baseDiff < 0) baseStatus = 'DOWN';
+                const avgDiff = avgNewPrice - avgOldPrice;
+                const avgImpact = avgDiff * currItem.qty;
+                const avgRate = avgOldPrice > 0 ? (avgNewPrice / avgOldPrice - 1) * 100 : 0;
+                let avgStatus = 'STAY';
+                if (avgDiff > 0.01) avgStatus = 'UP'; else if (avgDiff < -0.01) avgStatus = 'DOWN';
+                calculatedResults.push(buildResult(baseOldPrice, baseNewPrice, baseDiff, baseImpact, baseRate, baseStatus, avgOldPrice, avgNewPrice, avgDiff, avgImpact, avgRate, avgStatus));
+              } else {
+                calculatedResults.push(buildResult(0, baseNewPrice, 0, 0, 0, 'NEW', 0, avgNewPrice, 0, 0, 0, 'NEW'));
+              }
+            }
+          });
+
+          // 保存状態の復元
+          const savedState = await loadLocalState();
+          calculatedResults = calculatedResults.map(r => {
+            const saved = savedState[r.itemCode];
+            if (saved) {
+              let updatedR = { ...r, confirmed: saved.confirmed };
+              if (saved.isLinked && saved.linkedFromCode) {
+                const matchedPrev = prevListForLinks.find(p => p.code === saved.linkedFromCode);
+                if (matchedPrev) updatedR = applyLinkingLogic(updatedR, matchedPrev, matchedPrev.price);
+              }
+              return updatedR;
+            }
+            return r;
+          });
+
+          setDiagnostics(diag);
+          setCurrTotalAmounts(currTotals);
+          setResults(calculatedResults);
+          saveLocalState(calculatedResults);
+
+          if (calculatedResults.length > 0) {
+            const changedCount = calculatedResults.filter(r => r.baseStatus === 'UP' || r.baseStatus === 'DOWN').length;
+            let msg = `分析完了！ 前月比で価格が変動した商品は ${changedCount} 件。`;
+            if (diag.volumeResolved > 0) msg += ` 容量解析: ${diag.volumeResolved}件成功。`;
+            if (diag.nextMatchedCodes > 0) msg += ` 翌月予測: ${diag.nextMatchedCodes}件マッチ。`;
+            setMessage({ type: 'success', text: msg });
+          } else {
+            setMessage({ type: 'error', text: '計算結果が0件でした。原因を確認してくれ！' });
+          }
+        } catch (err) {
+          setMessage({ type: 'error', text: `エラー: ${err.message}` });
+        } finally {
+          setIsCalculating(false);
+        }
+      };
+
+      const mappedResults = results.map(r => {
+        const useAvg = priceMode === 'AVERAGE' && !r.isSpecial;
+        return {
+          ...r,
+          activeOldPrice: useAvg ? r.avgOldPrice : r.baseOldPrice,
+          activeNewPrice: useAvg ? r.avgNewPrice : r.baseNewPrice,
+          activeDiff: useAvg ? r.avgDiff : r.baseImpact / r.qty || 0,
+          activeImpact: useAvg ? r.avgImpact : r.baseImpact,
+          activeRate: useAvg ? r.avgRate : r.baseRate,
+          activeStatus: useAvg ? r.avgStatus : r.baseStatus,
+          activeNextDiff: useAvg ? r.nextAvgDiff : r.nextBaseDiff,
+          activeNextImpact: useAvg ? r.nextAvgImpact : r.nextBaseImpact,
+          activeNextStatus: useAvg ? r.nextAvgStatus : r.nextBaseStatus,
+        };
+      });
+
+      const uniqueItems = useMemo(() => {
+        const filteredByTab = results.filter(r => activeTab === 'ALL' || r.category === activeTab);
+        const items = new Set(filteredByTab.map(r => r.itemName).filter(n => n));
+        return Array.from(items).sort();
+      }, [results, activeTab]);
+
+      const tabResults = mappedResults.filter(r => {
+        const matchTab = activeTab === 'ALL' || r.category === activeTab;
+        const matchSupplier = supplierQuery === '' || (r.supplier && r.supplier.includes(supplierQuery));
+        const matchItem = itemQuery === '' || (r.itemName && r.itemName.includes(itemQuery)) || (r.itemCode && r.itemCode.includes(itemQuery));
+        return matchTab && matchSupplier && matchItem;
+      });
+
+      let displayResults = [...tabResults];
+      displayResults.sort((a, b) => {
+        if (viewMode === 'ACTUAL') {
+          const aHasSuggest = a.activeStatus === 'NEW' && !a.isLinked && !!a.suggestedLink;
+          const bHasSuggest = b.activeStatus === 'NEW' && !b.isLinked && !!b.suggestedLink;
+          if (aHasSuggest && !bHasSuggest) return -1;
+          if (!aHasSuggest && bHasSuggest) return 1;
+          if (a.isSpecial !== b.isSpecial) return a.isSpecial ? 1 : -1;
+          const customOrder = config.statusSortOrder || ['UP', 'DOWN', 'STAY', 'NEW'];
+          const orderA = customOrder.indexOf(a.activeStatus);
+          const orderB = customOrder.indexOf(b.activeStatus);
+          if (orderA !== orderB) { const posA = orderA === -1 ? 99 : orderA; const posB = orderB === -1 ? 99 : orderB; return posA - posB; }
+          return Math.abs(b.activeImpact) - Math.abs(a.activeImpact);
+        } else {
+          if (a.isSpecial !== b.isSpecial) return a.isSpecial ? 1 : -1;
+          const customOrder = config.statusSortOrder || ['UP', 'DOWN', 'STAY', 'NEW'];
+          const orderA = customOrder.indexOf(a.activeNextStatus);
+          const orderB = customOrder.indexOf(b.activeNextStatus);
+          if (orderA !== orderB) { const posA = orderA === -1 ? 99 : orderA; const posB = orderB === -1 ? 99 : orderB; return posA - posB; }
+          return Math.abs(b.activeNextImpact) - Math.abs(a.activeNextImpact);
+        }
+      });
+
+      const filteredResults = displayResults.filter(r => {
+        if (showOnlyChanges) {
+          if (viewMode === 'ACTUAL') return r.activeStatus !== 'STAY' && !(r.activeStatus === 'NEW' && !r.isSpecial);
+          else return r.hasNextData && r.activeNextImpact !== 0;
+        }
+        return true;
+      });
+
+      const stats = {
+        totalItems: tabResults.length,
+        upCount: tabResults.filter(r => r.activeStatus === 'UP').length,
+        downCount: tabResults.filter(r => r.activeStatus === 'DOWN').length,
+        costUp: tabResults.filter(r => r.activeStatus === 'UP').reduce((s, r) => s + r.activeImpact, 0),
+        costDown: tabResults.filter(r => r.activeStatus === 'DOWN').reduce((s, r) => s + r.activeImpact, 0),
+        nextUpCount: tabResults.filter(r => r.hasNextData && r.activeNextStatus === 'UP').length,
+        nextDownCount: tabResults.filter(r => r.hasNextData && r.activeNextStatus === 'DOWN').length,
+        nextCostUp: tabResults.filter(r => r.hasNextData && r.activeNextStatus === 'UP').reduce((s, r) => s + r.activeNextImpact, 0),
+        nextCostDown: tabResults.filter(r => r.hasNextData && r.activeNextStatus === 'DOWN').reduce((s, r) => s + r.activeNextImpact, 0),
+      };
+
+      const currentPureImpact = viewMode === 'ACTUAL' ? (stats.costUp + stats.costDown) : (stats.nextCostUp + stats.nextCostDown);
+      const currentCostUp = viewMode === 'ACTUAL' ? stats.costUp : stats.nextCostUp;
+      const currentCostDown = viewMode === 'ACTUAL' ? stats.costDown : stats.nextCostDown;
+      const currentUpCount = viewMode === 'ACTUAL' ? stats.upCount : stats.nextUpCount;
+      const currentDownCount = viewMode === 'ACTUAL' ? stats.downCount : stats.nextDownCount;
+      const filteredQtyTotal = filteredResults.reduce((sum, r) => sum + r.qty, 0);
+      const filteredImpactTotal = filteredResults.reduce((sum, r) => sum + r.activeImpact, 0);
+      const filteredAmountTotal = filteredResults.reduce((sum, r) => sum + r.amount, 0);
+      const filteredNextImpactTotal = filteredResults.reduce((sum, r) => sum + (r.hasNextData ? r.activeNextImpact : 0), 0);
+      const infoMartTotal = currTotalAmounts[activeTab] || 0;
+      const coverage = infoMartTotal > 0 ? ((filteredAmountTotal / infoMartTotal) * 100).toFixed(1) : 0;
+
+      const handleDownload = () => {
+        if (results.length === 0) return;
+        let csv = "\uFEFF";
+        const escape = str => `"${String(str).replace(/"/g, '""')}"`;
+        if (viewMode === 'ACTUAL') {
+          csv += ['店舗名','カテゴリ','取引先','商品コード','商品名','規格','単位','当月数量','前月単価','当月単価','単価差額','当月金額','変動状態','当月影響額','変動率(%)','確認状態','備考(紐付け等)','容量単価','統一価格'].join(",") + "\n";
+          filteredResults.forEach(r => {
+            csv += [
+              escape(r.shop), escape(r.category), escape(r.supplier), escape(r.itemCode.startsWith('NO_CODE') ? '未登録' : r.itemCode), escape(r.itemName), escape(r.spec),
+              escape(r.unit || ''), formatQty(r.qty),
+              r.activeStatus === 'NEW' && !r.isSpecial ? '-' : Math.round(r.activeOldPrice),
+              Math.round(r.activeNewPrice),
+              r.activeStatus === 'NEW' && !r.isSpecial ? '-' : Math.round(r.activeDiff),
+              Math.round(r.amount),
+              r.activeStatus === 'UP' ? '値上げ' : r.activeStatus === 'DOWN' ? '値下げ' : r.activeStatus === 'NEW' ? '新規/不一致' : '維持',
+              r.activeStatus === 'NEW' && !r.isSpecial ? '-' : Math.round(r.activeImpact),
+              r.activeStatus === 'NEW' && !r.isSpecial ? '-' : r.activeRate.toFixed(1),
+              r.confirmed ? '承認済' : '未確認',
+              escape(r.isLinked ? `【切替元】${r.linkedFrom.supplier} : ${r.linkedFrom.name}` : ''),
+              r.volumeUnitPrice ? `${r.volumeUnitPrice.pricePerUnit.toFixed(2)}${r.volumeUnitPrice.unit}` : '',
+              r.unifiedTarget || '',
+            ].join(",") + "\n";
+          });
+        } else {
+          csv += ['店舗名','カテゴリ','取引先','商品コード','商品名','規格','単位','当月数量','当月単価','翌月予測単価','予測単価差額','当月金額','予測状態','翌月予測影響額','確認状態','備考'].join(",") + "\n";
+          filteredResults.forEach(r => {
+            csv += [
+              escape(r.shop), escape(r.category), escape(r.supplier), escape(r.itemCode.startsWith('NO_CODE') ? '未登録' : r.itemCode), escape(r.itemName), escape(r.spec),
+              escape(r.unit || ''), formatQty(r.qty), Math.round(r.activeNewPrice),
+              r.hasNextData ? Math.round(r.nextPrice) : '-',
+              r.hasNextData ? Math.round(r.activeNextDiff) : '-',
+              Math.round(r.amount),
+              r.activeNextStatus === 'UP' ? '値上げ予測' : r.activeNextStatus === 'DOWN' ? '値下げ予測' : r.activeNextStatus === 'STAY' ? '維持予測' : '-',
+              r.hasNextData ? Math.round(r.activeNextImpact) : '-',
+              r.confirmed ? '承認済' : '未確認',
+              escape(r.isLinked ? `【切替元】${r.linkedFrom.supplier} : ${r.linkedFrom.name}` : ''),
+            ].join(",") + "\n";
+          });
+        }
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
+        const modeName = viewMode === 'ACTUAL' ? '当月実績' : '翌月予測';
+        link.download = `月次価格変動_${modeName}_${activeTab}_${new Date().toISOString().split('T')[0]}.csv`;
+        link.click();
+      };
+
+      if (!configLoaded) return <div className="flex items-center justify-center h-screen text-textmuted font-bold">設定を読み込み中...</div>;
+
+      return (
+        <div className="min-h-screen bg-pagebg text-textmain p-2 md:p-4 font-sans">
+          <ConfigModal isOpen={isConfigOpen} onClose={() => setIsConfigOpen(false)} initialConfig={config} onSave={handleSaveConfig} />
+
+          <div className="w-full max-w-[1600px] mx-auto space-y-4 md:space-y-6">
+            <header className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b-2 border-bordercol">
+              <div className="flex items-center gap-4">
+                <div className="p-3 bg-brand rounded-xl text-white shadow-md"><TrendingUp size={32} /></div>
+                <div>
+                  <h1 className="text-2xl md:text-3xl font-black text-textmain tracking-tight flex flex-wrap items-center gap-2">
+                    MONTHLY PRICE TRACKER
+                    <span className="text-[10px] bg-slate-100 border border-slate-200 text-slate-500 px-2 py-0.5 rounded font-bold">v2 Lynn Edition</span>
+                  </h1>
+                  <p className="text-sm md:text-base text-textmuted mt-1 font-medium">IndexedDB永続化 / PapaParse / 容量正規化 / AI対応準備済</p>
+                </div>
+              </div>
+              <button onClick={() => setIsConfigOpen(true)} className="flex items-center justify-center gap-2 bg-white hover:bg-slate-50 text-slate-700 px-4 py-2 md:py-3 rounded-xl font-black transition-colors border-2 border-slate-200 shadow-sm whitespace-nowrap">
+                <Settings size={20} className="text-brand" /> システム設定を変更
+              </button>
+            </header>
+
+            {message.text && (
+              <div className={`p-4 rounded-xl flex items-center gap-4 text-sm font-bold border-2 shadow-sm ${message.type === 'error' ? 'bg-red-50 text-red-600 border-red-200' : 'bg-blue-50 text-blue-700 border-blue-200'}`}>
+                {message.type === 'error' && <AlertTriangle size={24} />}
+                <span>{message.text}</span>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 lg:grid-cols-4 xl:grid-cols-5 gap-4 md:gap-6">
+              <div className="lg:col-span-1 space-y-6">
+                <div className="bg-cardbg p-5 rounded-2xl border border-bordercol shadow-sm">
+                  <h2 className="text-base font-black text-textmain mb-4 flex items-center gap-2"><UploadCloud size={20} className="text-brand"/> 実績・予測データ読込</h2>
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-xs font-bold text-textmuted mb-1">1. <span className="text-slate-700">【前月】</span>の発注実績 (CSV)</label>
+                      <input type="file" accept=".csv" onChange={e => setPrevFile(e.target.files[0])} className="block w-full text-xs file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-bold file:bg-slate-100 file:text-slate-700 hover:file:bg-slate-200 cursor-pointer border border-bordercol rounded-lg bg-pagebg" />
+                    </div>
+                    <div className="pt-3 border-t border-bordercol">
+                      <label className="block text-xs font-bold text-textmuted mb-1">2. <span className="text-brand">【当月】</span>の発注実績 (CSV)</label>
+                      <input type="file" accept=".csv" onChange={e => setCurrFile(e.target.files[0])} className="block w-full text-xs file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-bold file:bg-blue-100 file:text-brand hover:file:bg-blue-200 cursor-pointer border border-bordercol rounded-lg bg-pagebg" />
+                    </div>
+                    <div className="pt-3 border-t border-bordercol bg-purple-50/50 -mx-5 px-5 py-3 rounded-b-xl border-dashed">
+                      <label className="block text-xs font-bold text-textmuted mb-1">3. <span className="text-next">【翌月】</span>の値上がり予定 <span className="text-[10px] font-normal text-slate-400">※任意</span></label>
+                      <input type="file" accept=".csv" onChange={e => setNextFile(e.target.files[0])} className="block w-full text-xs file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-bold file:bg-purple-100 file:text-next hover:file:bg-purple-200 cursor-pointer border border-purple-200 rounded-lg bg-white" />
+                    </div>
+                  </div>
+                </div>
+
+                <button onClick={handleCalculate} disabled={isCalculating || !prevFile || !currFile} className="w-full flex items-center justify-center gap-2 bg-textmain hover:bg-slate-700 text-white p-3 rounded-xl font-black transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-md text-base">
+                  {isCalculating ? 'データ照合中...' : '価格変動をチェック'}
+                </button>
+
+                {/* ★ テストモードボタン */}
+                <button onClick={handleDemoTest} className="w-full flex items-center justify-center gap-2 bg-amber-50 hover:bg-amber-100 text-amber-700 p-2 rounded-xl font-bold transition-all border-2 border-amber-200 text-sm">
+                  <Beaker size={16}/> テストデータで動作確認
+                </button>
+
+                <div className="bg-blue-50 p-5 rounded-2xl border border-blue-200 shadow-sm">
+                  <h2 className="text-base font-black text-blue-800 mb-4 flex items-center gap-2"><BookOpen size={20} /> 使い方ガイド</h2>
+                  <div className="space-y-5 text-sm text-slate-700">
+                    <div>
+                      <h3 className="font-bold text-blue-700 border-b border-blue-200 pb-1 mb-2 flex items-center gap-1"><Check size={16}/> 店舗がやること</h3>
+                      <ol className="list-decimal pl-5 space-y-1.5 font-medium text-xs md:text-sm">
+                        <li><strong>前月</strong>と<strong>当月</strong>の実績CSVデータをセット</li>
+                        <li>「価格変動をチェック」ボタンを押す</li>
+                        <li>リストを確認し、承認ボタンを押す</li>
+                        <li>「NEW」は紐付けボタンで前月商品と結びつける</li>
+                        <li>CSVボタンで保存！</li>
+                      </ol>
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-emerald-700 border-b border-emerald-200 pb-1 mb-2">v2 新機能</h3>
+                      <ul className="list-disc pl-5 space-y-1.5 font-medium text-xs">
+                        <li><strong>データ永続化:</strong> IndexedDBで安定保存</li>
+                        <li><strong>CSV解析強化:</strong> PapaParseで堅牢に</li>
+                        <li><strong>容量単価:</strong> g/ml単位で自動比較</li>
+                        <li><strong>統一価格バッジ:</strong> 適用商品が一目瞭然</li>
+                        <li><strong>設定共有:</strong> JSON export/import</li>
+                        <li><strong>テストモード:</strong> デモデータで検証</li>
+                        <li><strong>AI対応準備:</strong> APIキー設定で即有効</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="lg:col-span-3 xl:col-span-4 flex flex-col space-y-4 md:space-y-6">
+                {/* サマリーパネル */}
+                <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+                  <div className="bg-blue-50 p-3 rounded-xl border border-blue-200 shadow-sm col-span-2 lg:col-span-2 border-l-4 border-l-brand flex flex-col justify-center">
+                    <p className="text-[11px] font-bold text-brand mb-1 truncate">{supplierQuery ? `【${supplierQuery}】` : `【${activeTab === 'ALL' ? '全カテゴリ' : activeTab}】`} 対象取引額</p>
+                    <p className="text-xl lg:text-2xl font-black text-textmain mb-1.5">¥{Math.round(filteredAmountTotal).toLocaleString()}</p>
+                    {!supplierQuery && (
+                      <div className="bg-white p-1.5 rounded border border-blue-100 flex justify-between items-center">
+                        <p className="text-[9px] font-bold text-textmuted">インフォマート全体とのカバー率</p>
+                        <div className="text-xs font-black text-brand bg-blue-50 px-1.5 py-0.5 rounded">{coverage}%</div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className={`p-3 rounded-xl border shadow-sm col-span-2 lg:col-span-2 border-l-4 flex flex-col justify-center relative overflow-hidden ${viewMode === 'FORECAST' ? 'bg-purple-50 border-purple-200 border-l-next' : 'bg-cardbg border-bordercol border-l-slate-400'}`}>
+                    {viewMode === 'FORECAST' && <div className="absolute top-0 right-0 bg-next text-white text-[10px] font-bold px-2 py-1 rounded-bl-lg">予測</div>}
+                    <p className={`text-xs font-bold mb-1 ${viewMode === 'FORECAST' ? 'text-purple-700' : 'text-textmuted'}`}>{viewMode === 'ACTUAL' ? '当月: 純コスト変動' : '翌月: 予測純コスト変動'}</p>
+                    <p className={`text-xl lg:text-2xl font-black ${currentPureImpact > 0 ? 'text-up' : currentPureImpact < 0 ? 'text-down' : 'text-textmain'}`}>
+                      {currentPureImpact > 0 ? '+' : currentPureImpact < 0 ? '-' : ''} ¥{Math.abs(Math.round(currentPureImpact)).toLocaleString()}
+                    </p>
+                  </div>
+
+                  <div className="bg-cardbg p-3 rounded-xl border border-bordercol shadow-sm lg:col-span-1 border-l-4 border-l-up flex flex-col justify-center">
+                    <p className="text-xs font-bold text-textmuted mb-1">値上げ増額</p>
+                    <p className="text-lg lg:text-xl font-black text-up">+ ¥{Math.round(currentCostUp).toLocaleString()}</p>
+                    <p className="text-[10px] text-slate-400 font-bold mt-1">対象: {currentUpCount}件</p>
+                  </div>
+
+                  <div className="bg-cardbg p-3 rounded-xl border border-bordercol shadow-sm lg:col-span-1 border-l-4 border-l-down flex flex-col justify-center">
+                    <p className="text-xs font-bold text-textmuted mb-1">値下げ減額</p>
+                    <p className="text-lg lg:text-xl font-black text-down">- ¥{Math.abs(Math.round(currentCostDown)).toLocaleString()}</p>
+                    <p className="text-[10px] text-slate-400 font-bold mt-1">対象: {currentDownCount}件</p>
+                  </div>
+                </div>
+
+                <div className="bg-cardbg rounded-2xl border border-bordercol shadow-md flex flex-col flex-1 min-h-[500px] overflow-hidden">
+                  {/* モード切替タブ */}
+                  <div className="flex px-3 pt-3 border-b border-bordercol bg-pagebg gap-2 overflow-x-auto hide-scrollbar">
+                    <button onClick={() => setViewMode('ACTUAL')} className={`px-5 py-2.5 text-sm font-black rounded-t-lg transition-colors border-t-4 whitespace-nowrap ${viewMode === 'ACTUAL' ? 'bg-white border-brand text-brand shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] z-10' : 'bg-slate-100 border-transparent text-slate-500 hover:bg-slate-200'}`}>📊 当月実績 (前月比)</button>
+                    <button onClick={() => setViewMode('FORECAST')} className={`px-5 py-2.5 text-sm font-black rounded-t-lg transition-colors border-t-4 whitespace-nowrap ${viewMode === 'FORECAST' ? 'bg-white border-next text-next shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] z-10' : 'bg-slate-100 border-transparent text-slate-500 hover:bg-slate-200'}`}>🔮 翌月予測 (当月比)</button>
+                  </div>
+
+                  {/* フィルター */}
+                  <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center border-b border-bordercol bg-white">
+                    <div className="flex overflow-x-auto w-full xl:w-auto hide-scrollbar px-2">
+                      {['ALL', '料理', '飲料', '経費'].map(t => (
+                        <button key={t} onClick={() => setActiveTab(t)} className={`px-4 py-3 text-sm font-black whitespace-nowrap transition-colors border-b-2 ${activeTab === t ? (viewMode === 'ACTUAL' ? 'border-brand text-brand' : 'border-next text-next') : 'border-transparent text-textmuted hover:text-textmain hover:bg-slate-50'}`}>
+                          {t === 'ALL' ? 'すべて' : t}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="p-2 w-full xl:w-auto flex flex-wrap items-center gap-3 bg-slate-50 xl:bg-transparent border-t xl:border-t-0 border-bordercol">
+                      <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200 mr-1">
+                        <button onClick={() => setPriceMode('LATEST')} className={`px-2.5 py-1.5 text-[11px] font-black rounded-md transition-all ${priceMode === 'LATEST' ? 'bg-white shadow-sm text-textmain' : 'text-slate-400 hover:text-slate-600'}`}>通常仕入れ単価</button>
+                        <button onClick={() => setPriceMode('AVERAGE')} className={`px-2.5 py-1.5 text-[11px] font-black rounded-md transition-all flex items-center gap-1 ${priceMode === 'AVERAGE' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}><Scale size={14}/> 実質平均単価</button>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <Filter size={14} className="text-slate-400" />
+                        <div className="relative flex items-center">
+                          <input type="text" list="supplier-list" value={supplierQuery} onChange={e => setSupplierQuery(e.target.value)} placeholder="業者検索..." className="text-xs font-bold border-2 border-slate-200 rounded-md pl-2 pr-6 py-1.5 bg-white text-slate-700 outline-none focus:border-brand w-[110px]"/>
+                          <datalist id="supplier-list">{uniqueSuppliers.map(s => <option key={s} value={s} />)}</datalist>
+                          {supplierQuery && <button onClick={() => setSupplierQuery('')} className="absolute right-1.5 p-0.5 text-slate-400 hover:text-slate-600 rounded-full bg-slate-100"><XIcon size={12}/></button>}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <div className="relative flex items-center">
+                          <input type="text" list="item-list" value={itemQuery} onChange={e => setItemQuery(e.target.value)} placeholder="商品・コード検索..." className="text-xs font-bold border-2 border-slate-200 rounded-md pl-2 pr-6 py-1.5 bg-white text-slate-700 outline-none focus:border-brand w-[130px]"/>
+                          <datalist id="item-list">{uniqueItems.map(i => <option key={i} value={i} />)}</datalist>
+                          {itemQuery && <button onClick={() => setItemQuery('')} className="absolute right-1.5 p-0.5 text-slate-400 hover:text-slate-600 rounded-full bg-slate-100"><XIcon size={12}/></button>}
+                        </div>
+                      </div>
+
+                      <div className="w-px h-5 bg-slate-200 hidden md:block"></div>
+                      <label className="flex items-center gap-1.5 text-xs font-bold text-textmain cursor-pointer">
+                        <input type="checkbox" checked={showOnlyChanges} onChange={e => setShowOnlyChanges(e.target.checked)} className="w-3.5 h-3.5 rounded border-slate-300 text-brand" />
+                        変動あり
+                      </label>
+                      <button onClick={handleDownload} disabled={filteredResults.length === 0} className="ml-auto flex items-center gap-1.5 px-3 py-1.5 bg-white text-textmain hover:bg-slate-50 rounded-md text-xs transition-colors border border-bordercol disabled:opacity-50 font-black shadow-sm"><Download size={14} /> CSV</button>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto flex-1 bg-white hide-scrollbar">
+                    <table className="w-full text-left border-collapse">
+                      <thead className="text-[9px] lg:text-[10px] font-black text-textmuted uppercase bg-slate-50 sticky top-0 shadow-sm z-10 border-b border-bordercol">
+                        {viewMode === 'ACTUAL' ? (
+                          <tr>
+                            <th className="px-1 py-1.5 w-[11%]">業者/カテゴリ</th>
+                            <th className="px-1 py-1.5 w-[22%]">商品名 (コード)</th>
+                            <th className="px-1 py-1.5 text-right border-r border-bordercol whitespace-nowrap w-[7%]">前月単価</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap w-[7%]">当月単価</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap bg-slate-100 w-[7%]">単価差額</th>
+                            <th className="px-1 py-1.5 text-center whitespace-nowrap w-[6%]">状態</th>
+                            <th className="px-1 py-1.5 text-center whitespace-nowrap w-[5%]">単位</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap w-[6%]">数量</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap bg-blue-50 text-brand w-[10%]">当月金額</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap w-[9%]">影響額</th>
+                            <th className="px-1 py-1.5 text-center whitespace-nowrap w-[10%] bg-slate-100">操作</th>
+                          </tr>
+                        ) : (
+                          <tr>
+                            <th className="px-1 py-1.5 w-[11%]">業者/カテゴリ</th>
+                            <th className="px-1 py-1.5 w-[22%]">商品名 (コード)</th>
+                            <th className="px-1 py-1.5 text-right border-r border-bordercol whitespace-nowrap w-[7%]">当月単価</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap text-next bg-purple-50 w-[7%]">翌月予測</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap bg-purple-50/50 w-[7%]">予測差額</th>
+                            <th className="px-1 py-1.5 text-center whitespace-nowrap w-[6%]">予測状態</th>
+                            <th className="px-1 py-1.5 text-center whitespace-nowrap w-[5%]">単位</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap w-[6%]">数量</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap text-slate-500 w-[10%]">金額</th>
+                            <th className="px-1 py-1.5 text-right whitespace-nowrap bg-purple-50 text-next w-[9%]">予測影響額</th>
+                            <th className="px-1 py-1.5 text-center whitespace-nowrap w-[10%] bg-slate-100">操作</th>
+                          </tr>
+                        )}
+                      </thead>
+                      <tbody className="divide-y divide-bordercol bg-white">
+                        {filteredResults.length === 0 && !diagnostics ? (
+                          <tr><td colSpan={11} className="px-2 py-24 text-center text-slate-400"><Activity size={48} className="mx-auto mb-4 text-slate-300" /><span className="text-sm font-bold">データがありません。ファイルを読み込んでください。</span></td></tr>
+                        ) : (
+                          <>
+                            {/* 合計行 */}
+                            <tr className="bg-slate-100 border-b-2 border-slate-300 sticky top-[28px] z-[9] shadow-sm">
+                              <td colSpan="7" className="px-1 py-1.5 text-right text-[9px] lg:text-[10px] font-black text-slate-600">表示中の合計 ({filteredResults.length}件)</td>
+                              <td className="px-1 py-1.5 text-[10px] lg:text-[11px] font-black text-right tabular-nums text-textmain whitespace-nowrap">{formatQty(filteredQtyTotal)}</td>
+                              <td className={`px-1 py-1.5 text-[10px] lg:text-[11px] font-black text-right tabular-nums whitespace-nowrap ${viewMode === 'ACTUAL' ? 'text-brand bg-blue-100/50' : 'text-slate-600'}`}>¥{Math.round(filteredAmountTotal).toLocaleString()}</td>
+                              <td className={`px-1 py-1.5 text-[10px] lg:text-[11px] font-black text-right tabular-nums whitespace-nowrap ${viewMode === 'ACTUAL' ? (filteredImpactTotal > 0 ? 'text-up' : filteredImpactTotal < 0 ? 'text-down' : 'text-slate-600') : 'text-next bg-purple-100/50'}`}>
+                                {viewMode === 'ACTUAL'
+                                  ? (filteredImpactTotal === 0 ? '¥0' : `${filteredImpactTotal > 0 ? '+' : '-'}¥${Math.abs(Math.round(filteredImpactTotal)).toLocaleString()}`)
+                                  : (filteredNextImpactTotal === 0 ? '¥0' : `${filteredNextImpactTotal > 0 ? '+' : '-'}¥${Math.abs(Math.round(filteredNextImpactTotal)).toLocaleString()}`)}
+                              </td>
+                              <td className="px-1 py-1.5 bg-slate-100"></td>
+                            </tr>
+
+                            {/* データ行 */}
+                            {filteredResults.map((r) => (
+                              <tr key={r.id} className={`transition-all duration-700 ease-in-out border-b border-bordercol group ${
+                                highlightedId === r.id ? 'bg-yellow-100 shadow-[0_0_15px_rgba(250,204,21,0.5)] z-20 relative' :
+                                r.confirmed ? 'bg-emerald-50/70 hover:bg-emerald-100/70' :
+                                r.isLinked ? 'bg-indigo-50/30 hover:bg-indigo-50' :
+                                r.activeStatus === 'STAY' || (!r.hasNextData && viewMode === 'FORECAST') ? 'opacity-70 hover:opacity-100 hover:bg-slate-50' : 'hover:bg-slate-50'
+                              } ${r.isSpecial ? 'bg-slate-50/50' : ''}`}>
+                                <td className="px-1 py-1.5 align-middle">
+                                  <div className="text-[9px] font-bold text-textmuted break-words leading-tight mb-0.5">{r.supplier || '（不明）'}</div>
+                                  <span className={`inline-block px-1 py-0.5 text-[8px] font-black rounded border ${r.category === '料理' ? 'bg-orange-50 text-orange-600 border-orange-200' : r.category === '飲料' ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-emerald-50 text-emerald-600 border-emerald-200'}`}>{r.category}</span>
+                                </td>
+                                <td className="px-2 py-2 align-middle min-w-[180px]">
+                                  <div className="text-[10px] font-black text-textmain leading-snug break-all">{r.itemName}</div>
+                                  <div className="flex flex-wrap items-center gap-1 mt-0.5">
+                                    {r.spec && <span className="text-[8px] font-bold text-slate-600 bg-slate-100 px-1 py-0.5 rounded truncate max-w-[80px]" title={r.spec}>{r.spec}</span>}
+                                    <span className="text-[8px] font-bold text-slate-400 font-mono truncate" title={r.itemCode}>{r.itemCode?.startsWith('NO_CODE') ? '未登録' : r.itemCode}</span>
+                                  </div>
+                                  {/* ★ 統一価格バッジ */}
+                                  {r.unifiedTarget && (
+                                    <div className="mt-1 text-[8px] font-bold text-blue-600 bg-blue-50 border border-blue-200 px-1 py-0.5 rounded inline-flex items-center gap-0.5">
+                                      <BookOpen size={8} className="shrink-0"/> 統一: {r.unifiedTarget}
+                                    </div>
+                                  )}
+                                  {/* ★ 容量単価バッジ */}
+                                  {r.volumeUnitPrice && !r.isSpecial && (
+                                    <div className="mt-1 text-[8px] font-bold text-teal-600 bg-teal-50 border border-teal-200 px-1 py-0.5 rounded inline-flex items-center gap-0.5">
+                                      <Scale size={8} className="shrink-0"/> {r.volumeUnitPrice.pricePerUnit.toFixed(2)}{r.volumeUnitPrice.unit} ({r.volumeUnitPrice.volume.raw})
+                                    </div>
+                                  )}
+                                  {/* 切替候補サジェスト */}
+                                  {r.activeStatus === 'NEW' && !r.isLinked && r.suggestedLink && viewMode === 'ACTUAL' && (
+                                    <div className="mt-1.5 p-1.5 bg-indigo-50 border border-indigo-200 rounded shadow-sm">
+                                      <div className="text-[8px] font-bold text-indigo-700 mb-0.5 flex items-center gap-0.5"><Activity size={10} /> 切替候補（類似度: {r.suggestedLinkScore}%）</div>
+                                      <div className="text-[9px] font-black text-textmain break-all leading-snug mb-0.5">{r.suggestedLink.name}</div>
+                                      <div className="text-[8px] text-slate-500 mb-1.5">{r.suggestedLink.supplier} | 前月単価: <span className="font-bold text-slate-700">{formatPrice(r.suggestedLink.price)}</span></div>
+                                      <div className="flex items-center gap-1">
+                                        <button onClick={() => handleAcceptSuggestion(r.id, r.suggestedLink)} className="px-1.5 py-1 bg-indigo-500 text-white text-[8px] font-bold rounded shadow hover:bg-indigo-600 flex items-center gap-0.5"><LinkIcon size={10}/> はい</button>
+                                        <button onClick={() => handleRejectSuggestion(r.id)} className="px-1.5 py-1 bg-white text-slate-500 text-[8px] font-bold rounded shadow hover:bg-slate-100 border border-slate-200 flex items-center gap-0.5"><XIcon size={10}/> いいえ</button>
+                                      </div>
+                                    </div>
+                                  )}
+                                  {r.isLinked && r.linkedFrom && (
+                                    <div className="mt-1 text-[8px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-200 px-1 py-0.5 rounded inline-flex items-center gap-0.5 w-full break-all">
+                                      <LinkIcon size={8} className="shrink-0"/> {r.linkedFrom.supplier} : {r.linkedFrom.name} から切替
+                                    </div>
+                                  )}
+                                </td>
+
+                                {viewMode === 'ACTUAL' ? (
+                                  <>
+                                    <td className="px-1 py-1.5 text-[10px] font-bold text-right tabular-nums text-textmuted border-r border-bordercol whitespace-nowrap align-middle">
+                                      {r.activeStatus === 'NEW' && !r.isSpecial ? '-' : formatPrice(r.activeOldPrice)}
+                                    </td>
+                                    <td className={`px-1 py-1.5 text-[10px] font-black text-right tabular-nums whitespace-nowrap align-middle ${r.activeStatus === 'UP' ? 'text-up' : r.activeStatus === 'DOWN' ? 'text-down' : 'text-textmain'}`}>
+                                      {formatPrice(r.activeNewPrice)}
+                                      {!r.isSpecial && r.activeStatus !== 'STAY' && r.activeStatus !== 'NEW' && <div className="text-[8px] font-bold opacity-80 mt-0.5">{r.activeStatus === 'UP' ? '+' : ''}{r.activeRate.toFixed(1)}%</div>}
+                                    </td>
+                                    <td className={`px-1 py-1.5 text-[10px] font-black text-right tabular-nums bg-slate-50/50 whitespace-nowrap align-middle ${r.activeDiff > 0 ? 'text-up' : r.activeDiff < 0 ? 'text-down' : 'text-slate-400'}`}>
+                                      {r.activeStatus === 'NEW' && !r.isSpecial ? '-' : formatDiff(r.activeDiff)}
+                                    </td>
+                                    <td className="px-1 py-1.5 text-center whitespace-nowrap align-middle">
+                                      {r.activeStatus === 'UP' ? <span className="inline-flex items-center gap-0.5 bg-red-100 text-up px-1 py-0.5 rounded text-[8px] font-black border border-red-200"><ArrowUpRight size={8}/> 値上</span> :
+                                       r.activeStatus === 'DOWN' ? <span className="inline-flex items-center gap-0.5 bg-emerald-100 text-down px-1 py-0.5 rounded text-[8px] font-black border border-emerald-200"><ArrowDownRight size={8}/> 値下</span> :
+                                       r.activeStatus === 'NEW' ? <span className="inline-flex items-center gap-0.5 bg-orange-100 text-orange-600 px-1 py-0.5 rounded text-[8px] font-black border border-orange-200"><Plus size={8}/> 新規</span> :
+                                       <span className="inline-flex items-center gap-0.5 bg-slate-100 text-slate-500 px-1 py-0.5 rounded text-[8px] font-black border border-slate-200"><Minus size={8}/> 維持</span>}
+                                    </td>
+                                    <td className="px-1 py-1.5 text-[9px] font-bold text-center tabular-nums text-textmuted whitespace-nowrap align-middle">{r.unit || '-'}</td>
+                                    <td className="px-1 py-1.5 text-[10px] font-bold text-right tabular-nums text-textmuted whitespace-nowrap align-middle">{formatQty(r.qty)}</td>
+                                    <td className="px-1 py-1.5 text-[10px] font-black text-right tabular-nums text-brand bg-blue-50/30 whitespace-nowrap align-middle">¥{Math.round(r.amount).toLocaleString()}</td>
+                                    <td className={`px-1 py-1.5 text-[10px] font-black text-right tabular-nums tracking-tight whitespace-nowrap align-middle ${r.activeStatus === 'UP' ? 'text-up' : r.activeStatus === 'DOWN' ? 'text-down' : 'text-slate-400'}`}>
+                                      {r.activeStatus === 'NEW' && !r.isSpecial ? '-' : (r.activeStatus === 'STAY' ? '¥0' : `${r.activeStatus === 'UP' ? '+' : '-'}¥${Math.abs(Math.round(r.activeImpact)).toLocaleString()}`)}
+                                    </td>
+                                  </>
+                                ) : (
+                                  <>
+                                    <td className="px-1 py-1.5 text-[10px] font-bold text-right tabular-nums text-textmain border-r border-bordercol whitespace-nowrap align-middle">{formatPrice(r.activeNewPrice)}</td>
+                                    <td className={`px-1 py-1.5 text-[10px] font-black text-right tabular-nums whitespace-nowrap align-middle bg-purple-50/50 ${!r.hasNextData ? 'text-slate-300' : r.activeNextStatus === 'UP' ? 'text-up' : r.activeNextStatus === 'DOWN' ? 'text-down' : 'text-next'}`}>{r.hasNextData ? formatPrice(r.nextPrice) : '-'}</td>
+                                    <td className={`px-1 py-1.5 text-[10px] font-black text-right tabular-nums bg-purple-50/30 whitespace-nowrap align-middle ${r.activeNextDiff > 0 ? 'text-up' : r.activeNextDiff < 0 ? 'text-down' : 'text-slate-400'}`}>{!r.hasNextData ? '-' : formatDiff(r.activeNextDiff)}</td>
+                                    <td className="px-1 py-1.5 text-center whitespace-nowrap align-middle">
+                                      {!r.hasNextData ? <span className="text-slate-300 text-[8px]">-</span> :
+                                       r.activeNextStatus === 'UP' ? <span className="inline-flex items-center gap-0.5 bg-red-100 text-up px-1 py-0.5 rounded text-[8px] font-black border border-red-200"><ArrowUpRight size={8}/> 値上予測</span> :
+                                       r.activeNextStatus === 'DOWN' ? <span className="inline-flex items-center gap-0.5 bg-emerald-100 text-down px-1 py-0.5 rounded text-[8px] font-black border border-emerald-200"><ArrowDownRight size={8}/> 値下予測</span> :
+                                       <span className="inline-flex items-center gap-0.5 bg-slate-100 text-slate-500 px-1 py-0.5 rounded text-[8px] font-black border border-slate-200"><Minus size={8}/> 維持予測</span>}
+                                    </td>
+                                    <td className="px-1 py-1.5 text-[9px] font-bold text-center tabular-nums text-textmuted whitespace-nowrap align-middle">{r.unit || '-'}</td>
+                                    <td className="px-1 py-1.5 text-[10px] font-bold text-right tabular-nums text-textmuted whitespace-nowrap align-middle">{formatQty(r.qty)}</td>
+                                    <td className="px-1 py-1.5 text-[10px] font-bold text-right tabular-nums text-slate-500 whitespace-nowrap align-middle">¥{Math.round(r.amount).toLocaleString()}</td>
+                                    <td className={`px-1 py-1.5 text-[10px] font-black text-right tabular-nums tracking-tight whitespace-nowrap align-middle ${r.hasNextData && r.activeNextImpact !== 0 ? (r.activeNextImpact > 0 ? 'text-next bg-purple-50/50' : 'text-down bg-purple-50/50') : 'text-slate-300'}`}>
+                                      {!r.hasNextData ? '-' : (r.activeNextImpact === 0 ? '¥0' : `${r.activeNextImpact > 0 ? '+' : '-'}¥${Math.abs(Math.round(r.activeNextImpact)).toLocaleString()}`)}
+                                    </td>
+                                  </>
+                                )}
+
+                                <td className="px-1 py-1.5 text-center align-middle bg-slate-50/30">
+                                  <div className="flex justify-center flex-wrap gap-1">
+                                    <button onClick={() => handleConfirm(r.id)} className={`p-1 rounded transition-all ${r.confirmed ? 'bg-emerald-500 text-white shadow-inner' : 'bg-white text-slate-300 border border-slate-200 hover:border-emerald-400 hover:text-emerald-500 shadow-sm'}`} title={r.confirmed ? "承認解除" : "承認する"}><Check size={12} strokeWidth={r.confirmed ? 3 : 2} /></button>
+                                    <button onClick={() => handleExclude(r.id)} className="p-1 rounded bg-white text-slate-300 border border-slate-200 hover:border-red-400 hover:text-red-500 hover:bg-red-50 transition-all shadow-sm" title="リストから除外"><Trash2 size={12} /></button>
+                                    {r.isLinked ? (
+                                      <button onClick={() => handleUnlink(r.id)} className="p-1 rounded bg-indigo-50 text-indigo-400 border border-indigo-200 hover:border-indigo-400 hover:text-indigo-600 transition-all shadow-sm" title="紐付け解除"><UnlinkIcon size={12} /></button>
+                                    ) : (
+                                      <button onClick={() => setLinkModal({isOpen: true, targetItem: r, searchQuery: ''})} className={`p-1 rounded transition-all shadow-sm ${r.activeStatus === 'NEW' && !r.isSpecial ? 'bg-orange-50 text-orange-400 border border-orange-200 hover:border-orange-400 hover:text-orange-600' : 'bg-white text-slate-300 border border-slate-200 hover:border-blue-400 hover:text-blue-500'}`} title="紐付ける"><LinkIcon size={12} /></button>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* 紐付けモーダル */}
+          {linkModal.isOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+              <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden border border-slate-200">
+                <div className="p-4 border-b border-bordercol flex justify-between items-center bg-slate-50">
+                  <h3 className="font-black text-textmain flex items-center gap-2"><LinkIcon size={18} className="text-brand" /> 前月商品と手動で紐付け</h3>
+                  <button onClick={() => setLinkModal({isOpen:false, targetItem:null, searchQuery:''})} className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-200 rounded-md"><XIcon size={20}/></button>
+                </div>
+                <div className="p-4 border-b border-bordercol bg-white flex flex-col gap-3">
+                  <div className="text-xs text-textmuted font-bold">以下の当月商品に対する前月の「切り替え元」を選択してください。</div>
+                  <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                    <div className="text-[10px] text-blue-600 font-bold mb-1">{linkModal.targetItem.shop} / {linkModal.targetItem.supplier}</div>
+                    <div className="text-sm font-black text-textmain">{linkModal.targetItem.itemName}</div>
+                  </div>
+                  <input type="text" placeholder="前月商品名や業者名で検索..." value={linkModal.searchQuery} onChange={(e) => setLinkModal({...linkModal, searchQuery: e.target.value})} className="w-full text-sm font-bold border-2 border-slate-200 rounded-lg pl-3 pr-3 py-2 bg-slate-50 text-slate-700 outline-none focus:border-brand focus:bg-white"/>
+                </div>
+                <div className="flex-1 overflow-y-auto p-3 bg-slate-50">
+                  {(() => {
+                    const query = linkModal.searchQuery.toLowerCase();
+                    const targetShop = linkModal.targetItem.shop;
+                    let filtered = prevItemsList.filter(p => !config.specialKeywords.some(keyword => p.name.includes(keyword)));
+                    if (query) filtered = filtered.filter(p => p.name.toLowerCase().includes(query) || p.supplier.toLowerCase().includes(query));
+                    else filtered = filtered.filter(p => p.shop === targetShop);
+                    if (filtered.length === 0) return <div className="p-8 text-center text-sm font-bold text-slate-400">候補が見つかりません。</div>;
+                    return (
+                      <div className="space-y-2">
+                        {filtered.map(p => (
+                          <div key={p.code} className="flex items-center justify-between bg-white p-3 rounded-xl border border-bordercol shadow-sm hover:border-brand hover:shadow-md transition-all cursor-pointer group" onClick={() => handleApplyLink(p)}>
+                            <div className="flex-1 overflow-hidden pr-3">
+                              <div className="text-[10px] text-slate-500 font-bold flex gap-2"><span>{p.shop}</span><span className="text-slate-300">|</span><span className="text-brand">{p.supplier}</span></div>
+                              <div className="text-sm md:text-base font-black text-textmain mt-1 group-hover:text-brand transition-colors break-words">{p.name}</div>
+                              {p.spec && <div className="text-xs text-slate-600 mt-1 bg-slate-100 px-1.5 py-0.5 rounded w-fit">{p.spec}</div>}
+                              <div className="text-xs text-slate-500 font-mono mt-1.5">単位: {p.unit || '-'} | 前月単価: <span className="font-bold text-slate-700">{formatPrice(p.price)}</span></div>
+                            </div>
+                            <button className="shrink-0 px-4 py-2 bg-slate-100 group-hover:bg-brand text-slate-600 group-hover:text-white text-sm font-black rounded-lg transition-colors shadow-sm border border-slate-200 group-hover:border-brand">選択</button>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
