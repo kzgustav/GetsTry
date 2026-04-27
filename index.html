@@ -106,58 +106,71 @@
     };
 
     // ======================================================================
-    // ★ MODULE 2: 容量正規化エンジン（AIなしでグラム単価計算）
+    // ★ MODULE 2: 容量正規化エンジン v2（AIなしでグラム単価計算）
     // ======================================================================
-    const UNIT_CONVERSIONS = {
-      // 重量 → グラム
-      'kg': 1000, 'ｋｇ': 1000, 'キロ': 1000,
-      'g': 1, 'ｇ': 1, 'グラム': 1,
-      // 容量 → ミリリットル
-      'l': 1000, 'ｌ': 1000, 'リットル': 1000, 'L': 1000,
-      'ml': 1, 'ｍｌ': 1, 'ミリリットル': 1, 'cc': 1,
-      'dl': 100, 'ｄｌ': 100, 'デシリットル': 100,
-      // 特殊容器（飲食業界の常識値）
+    const UNIT_MAP = {
+      'kg': { base: 'g', factor: 1000 }, 'キロ': { base: 'g', factor: 1000 },
+      'g': { base: 'g', factor: 1 }, 'グラム': { base: 'g', factor: 1 },
+      'l': { base: 'ml', factor: 1000 }, 'リットル': { base: 'ml', factor: 1000 },
+      'ml': { base: 'ml', factor: 1 }, 'ミリリットル': { base: 'ml', factor: 1 },
+      'cc': { base: 'ml', factor: 1 },
+      'dl': { base: 'ml', factor: 100 }, 'デシリットル': { base: 'ml', factor: 100 },
+      'ガロン': { base: 'ml', factor: 3785 }, 'gallon': { base: 'ml', factor: 3785 },
     };
 
-    // 飲食業界の暗黙知辞書（「中瓶」=334mlなど）
     const CONTAINER_SIZES = {
-      '大瓶': { ml: 633 }, '大びん': { ml: 633 },
-      '中瓶': { ml: 334 }, '中びん': { ml: 334 }, '中ビン': { ml: 334 },
-      '小瓶': { ml: 250 }, '小びん': { ml: 250 },
-      'レギュラー缶': { ml: 350 }, 'ロング缶': { ml: 500 },
-      '樽': null, // 樽はサイズが明記されるので辞書不要
+      '大瓶': 633, '大びん': 633,
+      '中瓶': 334, '中びん': 334, '中ビン': 334,
+      '小瓶': 250, '小びん': 250,
+      'レギュラー缶': 350, 'ロング缶': 500,
+      'ソーダ瓶': 200, 'ソ-ダ瓶': 200,
     };
+
+    // 日本酒の慣習値（商品名に「1.8」だけで単位なし → 一升瓶）
+    const SAKE_ISSHOH_PATTERN = /(?:^|[\s　])1\.8(?:\s|$|[^0-9])/;
 
     const extractVolume = (nameAndSpec) => {
       const text = String(nameAndSpec).normalize('NFKC');
 
-      // パターン1: 数値+単位 （例: 700ml, 1.5L, 10kg, 5L）
-      const patterns = [
-        /(\d+(?:\.\d+)?)\s*(kg|ｋｇ|キロ|g|ｇ|グラム|l|ｌ|リットル|L|ml|ｍｌ|ミリリットル|cc|dl|ｄｌ|デシリットル)/gi,
-      ];
-      for (const pat of patterns) {
-        const match = pat.exec(text);
-        if (match) {
-          const num = parseFloat(match[1]);
-          const unitKey = match[2].toLowerCase();
-          const factor = UNIT_CONVERSIONS[unitKey] || UNIT_CONVERSIONS[match[2]];
-          if (factor) {
-            const baseUnit = ['kg','ｋｇ','キロ','g','ｇ','グラム'].some(u => unitKey === u.toLowerCase()) ? 'g' : 'ml';
-            return { value: num * factor, unit: baseUnit, raw: match[0] };
-          }
+      // ステップ1: 入数表記 — 数値+単位×数値 or 数値+単位・数値
+      //   例: "4.5ML×20" → 4.5ml × 20 = 90ml
+      //   例: "10G×100" → 10g × 100 = 1000g
+      //   例: "190ml・30" → 190ml (1本あたり)
+      const entryPat = /(\d+(?:\.\d+)?)\s*(kg|g|l|ml|cc|dl|キロ|グラム|リットル|ミリリットル|ガロン)\s*[×xX\*]\s*(\d+)/gi;
+      let m = entryPat.exec(text);
+      if (m) {
+        const per = parseFloat(m[1]);
+        const uKey = m[2].toLowerCase();
+        const u = UNIT_MAP[uKey] || UNIT_MAP[m[2]];
+        const count = parseInt(m[3]);
+        if (u) return { value: per * u.factor * count, unit: u.base, raw: m[0], isMultiPack: true };
+      }
+
+      // ステップ2: 基本パターン — 数値+単位（最初にヒットしたもの）
+      //   例: "700ml", "1.5L", "10kg", "2.5ガロン"
+      const unitKeys = Object.keys(UNIT_MAP).sort((a, b) => b.length - a.length).join('|');
+      const basicPat = new RegExp('(\\d+(?:\\.\\d+)?)\\s*(' + unitKeys + ')', 'gi');
+      m = basicPat.exec(text);
+      if (m) {
+        const num = parseFloat(m[1]);
+        const uKey = m[2].toLowerCase();
+        const u = UNIT_MAP[uKey] || UNIT_MAP[m[2]];
+        if (u) return { value: num * u.factor, unit: u.base, raw: m[0] };
+      }
+
+      // ステップ3: 容器名辞書
+      for (const [container, ml] of Object.entries(CONTAINER_SIZES)) {
+        if (text.includes(container)) {
+          return { value: ml, unit: 'ml', raw: container };
         }
       }
 
-      // パターン2: 容器名辞書 （例: 中瓶）
-      for (const [container, size] of Object.entries(CONTAINER_SIZES)) {
-        if (text.includes(container) && size) {
-          const unit = size.ml ? 'ml' : 'g';
-          const value = size.ml || size.g;
-          return { value, unit, raw: container };
-        }
+      // ステップ4: 一升瓶推定 — "千秋蔵 1.8" のように単位なしで1.8だけ書いてあるケース
+      if (SAKE_ISSHOH_PATTERN.test(text)) {
+        return { value: 1800, unit: 'ml', raw: '1.8(一升推定)', confidence: 'medium' };
       }
 
-      return null; // 容量情報なし
+      return null;
     };
 
     const calcUnitPrice = (price, volume) => {
@@ -644,6 +657,7 @@ B001,白州,700ml,サントリー酒類,本,2,6600,13200,飲料`;
       const [viewMode, setViewMode] = useState('ACTUAL');
       const [priceMode, setPriceMode] = useState('LATEST');
       const [highlightedId, setHighlightedId] = useState(null);
+      const [volumeReportOpen, setVolumeReportOpen] = useState(false);
 
       // ★ 起動時: IndexedDBから設定読み込み + localStorage移行
       useEffect(() => {
@@ -1374,6 +1388,7 @@ B001,白州,700ml,サントリー酒類,本,2,6600,13200,飲料`;
                         変動あり
                       </label>
                       <button onClick={handleDownload} disabled={filteredResults.length === 0} className="ml-auto flex items-center gap-1.5 px-3 py-1.5 bg-white text-textmain hover:bg-slate-50 rounded-md text-xs transition-colors border border-bordercol disabled:opacity-50 font-black shadow-sm"><Download size={14} /> CSV</button>
+                      <button onClick={() => setVolumeReportOpen(true)} disabled={results.length === 0} className="flex items-center gap-1.5 px-3 py-1.5 bg-teal-50 text-teal-700 hover:bg-teal-100 rounded-md text-xs transition-colors border border-teal-200 disabled:opacity-50 font-black shadow-sm"><Scale size={14} /> 容量</button>
                     </div>
                   </div>
 
@@ -1544,6 +1559,88 @@ B001,白州,700ml,サントリー酒類,本,2,6600,13200,飲料`;
               </div>
             </div>
           </div>
+
+          {/* ★ 容量解析レポートモーダル */}
+          {volumeReportOpen && results.length > 0 && (() => {
+            const all = results.filter(r => !r.isSpecial);
+            const resolved = all.filter(r => r.volumeUnitPrice);
+            const failed = all.filter(r => !r.volumeUnitPrice);
+            const byCategory = {};
+            all.forEach(r => {
+              if (!byCategory[r.category]) byCategory[r.category] = { total: 0, ok: 0 };
+              byCategory[r.category].total++;
+              if (r.volumeUnitPrice) byCategory[r.category].ok++;
+            });
+            return (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+                <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden border border-slate-200">
+                  <div className="p-4 border-b border-bordercol flex justify-between items-center bg-slate-50">
+                    <h3 className="font-black text-textmain flex items-center gap-2"><Scale size={18} className="text-teal-500" /> 容量解析レポート</h3>
+                    <button onClick={() => setVolumeReportOpen(false)} className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-200 rounded-md"><XIcon size={20}/></button>
+                  </div>
+                  <div className="p-4 border-b border-bordercol bg-white">
+                    <div className="grid grid-cols-3 gap-3 mb-3">
+                      <div className="bg-teal-50 p-3 rounded-lg border border-teal-200 text-center">
+                        <div className="text-2xl font-black text-teal-700">{resolved.length}</div>
+                        <div className="text-xs font-bold text-teal-600">解析成功</div>
+                      </div>
+                      <div className="bg-amber-50 p-3 rounded-lg border border-amber-200 text-center">
+                        <div className="text-2xl font-black text-amber-700">{failed.length}</div>
+                        <div className="text-xs font-bold text-amber-600">解析不可</div>
+                      </div>
+                      <div className="bg-blue-50 p-3 rounded-lg border border-blue-200 text-center">
+                        <div className="text-2xl font-black text-blue-700">{all.length > 0 ? Math.round(resolved.length / all.length * 100) : 0}%</div>
+                        <div className="text-xs font-bold text-blue-600">解析率</div>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      {Object.entries(byCategory).map(([cat, v]) => (
+                        <span key={cat} className="text-xs font-bold bg-slate-100 px-2 py-1 rounded border border-slate-200">
+                          {cat}: {v.ok}/{v.total} ({Math.round(v.ok/v.total*100)}%)
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-3 bg-slate-50">
+                    <h4 className="font-black text-sm text-amber-700 mb-2 flex items-center gap-1"><AlertTriangle size={14}/> 容量解析できなかった商品 ({failed.length}件)</h4>
+                    <p className="text-[10px] text-textmuted mb-3">生鮮品（野菜・魚介・肉）や経費（備品・消耗品）は重量/容量が固定でないため、解析対象外です。AI機能を有効にすると推定精度が向上します。</p>
+                    <div className="space-y-1">
+                      {failed.map(r => (
+                        <div key={r.id} className="flex items-center justify-between bg-white p-2 rounded-lg border border-slate-200 text-xs">
+                          <div className="flex-1 min-w-0">
+                            <span className={`inline-block px-1 py-0.5 text-[8px] font-black rounded mr-1 ${r.category === '料理' ? 'bg-orange-50 text-orange-600' : r.category === '飲料' ? 'bg-blue-50 text-blue-600' : 'bg-emerald-50 text-emerald-600'}`}>{r.category}</span>
+                            <span className="font-bold text-textmain">{r.itemName}</span>
+                            {r.spec && <span className="text-slate-400 ml-1">({r.spec})</span>}
+                          </div>
+                          <span className="text-slate-400 font-mono shrink-0 ml-2">{formatPrice(r.baseNewPrice)}</span>
+                        </div>
+                      ))}
+                    </div>
+                    {resolved.length > 0 && (
+                      <>
+                        <h4 className="font-black text-sm text-teal-700 mt-4 mb-2 flex items-center gap-1"><Check size={14}/> 容量解析成功 ({resolved.length}件)</h4>
+                        <div className="space-y-1">
+                          {resolved.sort((a,b) => (b.volumeUnitPrice?.pricePerUnit || 0) - (a.volumeUnitPrice?.pricePerUnit || 0)).map(r => (
+                            <div key={r.id} className="flex items-center justify-between bg-white p-2 rounded-lg border border-teal-100 text-xs">
+                              <div className="flex-1 min-w-0">
+                                <span className={`inline-block px-1 py-0.5 text-[8px] font-black rounded mr-1 ${r.category === '料理' ? 'bg-orange-50 text-orange-600' : r.category === '飲料' ? 'bg-blue-50 text-blue-600' : 'bg-emerald-50 text-emerald-600'}`}>{r.category}</span>
+                                <span className="font-bold text-textmain">{r.itemName}</span>
+                                {r.spec && <span className="text-slate-400 ml-1">({r.spec})</span>}
+                              </div>
+                              <div className="shrink-0 ml-2 text-right">
+                                <span className="font-black text-teal-700">{r.volumeUnitPrice.pricePerUnit.toFixed(2)}{r.volumeUnitPrice.unit}</span>
+                                <span className="text-slate-400 ml-1">({r.volumeUnitPrice.volume.raw})</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* 紐付けモーダル */}
           {linkModal.isOpen && (
